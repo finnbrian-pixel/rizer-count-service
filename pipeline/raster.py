@@ -11,11 +11,14 @@ from .nms import non_max_suppression
 
 logger = logging.getLogger(__name__)
 
+# Canonical rasterization resolution — MUST be 300 DPI everywhere
+DPI = 300
+
 # Canonical template window size (px)
 TEMPLATE_WINDOW = (48, 48)
 
 
-def rasterize_page(page: fitz.Page, dpi: int = 300) -> np.ndarray:
+def rasterize_page(page: fitz.Page, dpi: int = DPI) -> np.ndarray:
     """
     Rasterize a PDF page to a grayscale numpy array.
 
@@ -31,6 +34,58 @@ def rasterize_page(page: fitz.Page, dpi: int = 300) -> np.ndarray:
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
     return img
+
+
+def extract_template_from_raster(
+    sheet_gray: np.ndarray,
+    legend_bbox: Tuple[float, float, float, float],
+    dpi: int = DPI,
+) -> np.ndarray:
+    """
+    Crop a template region from the rasterized sheet image using PDF-space coordinates.
+
+    PDF coordinates are in points (72 pts = 1 inch). The rasterized image is at `dpi`
+    resolution, so pixel dimensions are (dpi / 72) times larger than the PDF coordinate
+    space. Any bbox from PDF point space MUST be scaled before indexing into the raster.
+
+    Args:
+        sheet_gray: Grayscale rasterized sheet image (numpy array at `dpi` resolution).
+        legend_bbox: (x0, y0, x1, y1) bounding box in PDF point coordinates.
+        dpi: Resolution the sheet was rasterized at (must match rasterize_page).
+
+    Returns:
+        Cropped grayscale template image (numpy array).
+
+    Raises:
+        ValueError: If the crop is blank/empty (all-white or zero-size), indicating
+            a coordinate space mismatch or an empty legend region.
+    """
+    # Scale PDF point coordinates to raster pixel coordinates
+    scale = dpi / 72.0
+    x0 = int(legend_bbox[0] * scale)
+    y0 = int(legend_bbox[1] * scale)
+    x1 = int(legend_bbox[2] * scale)
+    y1 = int(legend_bbox[3] * scale)
+
+    # Clamp to image bounds
+    h, w = sheet_gray.shape[:2]
+    x0 = max(0, min(x0, w))
+    y0 = max(0, min(y0, h))
+    x1 = max(0, min(x1, w))
+    y1 = max(0, min(y1, h))
+
+    tpl = sheet_gray[y0:y1, x0:x1]
+
+    # Guard: detect blank/empty crop — a white crop means the bbox missed the symbol
+    if tpl is None or tpl.size == 0 or tpl.mean() > 250:
+        mean_val = 0.0 if (tpl is None or tpl.size == 0) else float(tpl.mean())
+        raise ValueError(
+            f"Template crop is blank (mean={mean_val:.1f}) — "
+            f"legend bbox coordinate space mismatch or empty legend region"
+        )
+
+    logger.info(f"Template acquired: shape={tpl.shape}, mean={tpl.mean():.1f}")
+    return tpl
 
 
 def preprocess_image(gray: np.ndarray) -> np.ndarray:
@@ -116,7 +171,7 @@ def run_template_matching(
     page: fitz.Page,
     templates: Dict[str, np.ndarray],
     threshold: float = 0.80,
-    dpi: int = 300,
+    dpi: int = DPI,
 ) -> Dict[str, List[Tuple[int, int, float]]]:
     """
     Run template matching for all templates on a rasterized page.
@@ -142,6 +197,14 @@ def run_template_matching(
             logger.warning(f"No template acquired for page — skipping Path B match for cluster {cluster_id}")
             raise ValueError("Path B template acquisition failed — no symbol crop available")
 
+        # Guard: reject all-white templates (coordinate space mismatch symptom)
+        if template.mean() > 250:
+            raise ValueError(
+                f"Template crop is blank (mean={template.mean():.1f}) — "
+                f"legend bbox coordinate space mismatch or empty legend region"
+            )
+        logger.info(f"Template acquired: shape={template.shape}, mean={template.mean():.1f}")
+
         # Also preprocess template
         if template.ndim == 3:
             template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
@@ -162,6 +225,62 @@ def run_template_matching(
                 f"score range [{min(scores):.3f}, {max(scores):.3f}], "
                 f"mean={np.mean(scores):.3f}"
             )
+
+    return results
+
+
+def run_template_matching_from_legend(
+    page: fitz.Page,
+    legend_bboxes: Dict[str, Tuple[float, float, float, float]],
+    threshold: float = 0.80,
+    dpi: int = DPI,
+) -> Dict[str, List[Tuple[int, int, float]]]:
+    """
+    Path B template matching: extract templates by cropping symbol bboxes from the
+    rasterized sheet, then run multi-scale matching across the full page.
+
+    This is the fallback when vector cluster samples are unavailable (pure raster PDFs).
+    The legend_bboxes are in PDF point coordinates and MUST be scaled by dpi/72 before
+    cropping the raster image.
+
+    Args:
+        page: PyMuPDF page object.
+        legend_bboxes: Dict of cluster_id -> (x0, y0, x1, y1) bbox in PDF points.
+        threshold: Match threshold.
+        dpi: Rasterization DPI.
+
+    Returns:
+        Dict of cluster_id -> list of (x, y, score) matches.
+    """
+    sheet_gray = rasterize_page(page, dpi=dpi)
+    sheet_processed = preprocess_image(sheet_gray)
+
+    results: Dict[str, List[Tuple[int, int, float]]] = {}
+
+    for cluster_id, bbox in legend_bboxes.items():
+        # Extract template with proper PDF->raster coordinate scaling
+        tpl = extract_template_from_raster(sheet_gray, bbox, dpi=dpi)
+
+        # Convert to grayscale if needed (should already be from rasterize_page)
+        if tpl.ndim == 3:
+            tpl = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+
+        # Resize to canonical template window
+        tpl = cv2.resize(tpl, TEMPLATE_WINDOW, interpolation=cv2.INTER_AREA)
+
+        template_processed = preprocess_image(tpl)
+        matches = match_heads(sheet_processed, template_processed, threshold=threshold)
+        results[cluster_id] = matches
+
+        scores = [m[2] for m in matches]
+        if scores:
+            logger.info(
+                f"Cluster {cluster_id} (legend crop): {len(scores)} matches, "
+                f"score range [{min(scores):.3f}, {max(scores):.3f}], "
+                f"mean={np.mean(scores):.3f}"
+            )
+        else:
+            logger.warning(f"Cluster {cluster_id} (legend crop): 0 matches at threshold {threshold}")
 
     return results
 
