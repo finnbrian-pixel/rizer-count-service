@@ -1,64 +1,39 @@
-"""Stage 0 — PDF Triage: determine if pages are vector, raster, or hybrid."""
-
+import fitz
 import logging
-from typing import List, Literal, Tuple
-
-import fitz  # PyMuPDF
 
 logger = logging.getLogger(__name__)
 
-PageRoute = Literal["vector", "raster", "hybrid"]
+VECTOR_PATH_THRESHOLD = 50
 
 
-def triage_page(page: fitz.Page) -> PageRoute:
-    """
-    Determine whether a page is vector-based, raster-based, or hybrid.
-
-    Checks for vector drawing objects (paths/curves) and image objects.
-    """
+def triage_page(pdf_path: str, page_no: int = 0) -> dict:
+    doc = fitz.open(pdf_path)
+    page = doc[page_no]
     drawings = page.get_drawings()
-    images = page.get_images(full=True)
+    meaningful_paths = [
+        d for d in drawings
+        if d.get("rect") and d["rect"].width > 5 and d["rect"].height > 5
+    ]
+    images = page.get_images(full=False)
+    text = page.get_text().strip()
+    has_text = len(text) > 10
+    vector_count = len(meaningful_paths)
+    image_count = len(images)
+    logger.info(f"Triage page {page_no}: {vector_count} meaningful vector paths, {image_count} embedded images")
 
-    has_vectors = len(drawings) > 10  # Meaningful vector content threshold
-    has_images = len(images) > 0
-
-    # Check if images cover significant page area
-    significant_raster = False
-    if has_images:
-        page_area = page.rect.width * page.rect.height
-        total_image_area = 0.0
-        for img in images:
-            xref = img[0]
-            try:
-                img_rects = page.get_image_rects(xref)
-                for rect in img_rects:
-                    total_image_area += rect.width * rect.height
-            except Exception:
-                continue
-        if total_image_area > 0.3 * page_area:
-            significant_raster = True
-
-    if has_vectors and significant_raster:
-        return "hybrid"
-    elif has_vectors:
-        return "vector"
+    if vector_count >= VECTOR_PATH_THRESHOLD and image_count == 0:
+        path, confidence, reason = "vector", min(1.0, vector_count / 500), f"{vector_count} vector paths, no images"
+    elif vector_count >= VECTOR_PATH_THRESHOLD and image_count > 0:
+        path, confidence, reason = "hybrid", 0.85, f"{vector_count} vector paths + {image_count} images"
+    elif vector_count < VECTOR_PATH_THRESHOLD and image_count > 0:
+        path, confidence, reason = "raster", min(1.0, image_count / 3), f"Only {vector_count} vector paths, {image_count} images"
     else:
-        return "raster"
+        path, confidence, reason = "raster", 0.5, f"Only {vector_count} vector paths, no images — likely notes page"
+
+    return {"path": path, "vector_path_count": vector_count, "image_count": image_count,
+            "has_text": has_text, "confidence": confidence, "reason": reason}
 
 
-def triage_pdf(doc: fitz.Document) -> List[Tuple[int, PageRoute]]:
-    """
-    Triage all pages in a PDF document.
-
-    Returns:
-        List of (page_index, route) tuples.
-    """
-    results: List[Tuple[int, PageRoute]] = []
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        route = triage_page(page)
-        logger.info(f"Page {page_idx}: routed to '{route}' "
-                    f"(drawings={len(page.get_drawings())}, "
-                    f"images={len(page.get_images(full=True))})")
-        results.append((page_idx, route))
-    return results
+def triage_pdf(pdf_path: str) -> list:
+    doc = fitz.open(pdf_path)
+    return [triage_page(pdf_path, page_no=i) for i in range(len(doc))]
