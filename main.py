@@ -7,6 +7,8 @@ via vector fingerprinting or template matching.
 
 import io
 import logging
+import os
+import tempfile
 import traceback
 from typing import Any, Dict, Optional
 
@@ -121,11 +123,19 @@ async def count_sprinkler_heads(
     try:
         # Stage 0 — Triage
         logger.info(f"Processing PDF: {pdf.filename}, {len(doc)} pages")
-        page_routes = triage_pdf(doc)
+
+        # Write PDF bytes to a temp file for triage (expects a file path string)
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp_pdf.write(pdf_bytes)
+        tmp_pdf.close()
+        tmp_pdf_path = tmp_pdf.name
+
+        page_routes = triage_pdf(tmp_pdf_path)
 
         results: list = []
 
-        for page_idx, route in page_routes:
+        for page_idx, triage_result in enumerate(page_routes):
+            route = triage_result["path"]
             page = doc[page_idx]
             page_width = page.rect.width
             page_height = page.rect.height
@@ -286,6 +296,11 @@ async def count_sprinkler_heads(
         )
     finally:
         doc.close()
+        # Clean up temp file
+        try:
+            os.unlink(tmp_pdf_path)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
