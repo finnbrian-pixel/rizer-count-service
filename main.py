@@ -8,6 +8,7 @@ via vector fingerprinting or template matching.
 import io
 import logging
 import os
+import shutil
 import tempfile
 import traceback
 from typing import Any, Dict, Optional
@@ -87,36 +88,43 @@ async def count_sprinkler_heads(
                 detail=f"Invalid corrections JSON: {e}",
             )
 
-    # Read PDF bytes
+    # Stream upload directly to temp file — never buffer full bytes in memory
+    tmp_pdf_path = None
     try:
-        pdf_bytes = await pdf.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+            shutil.copyfileobj(pdf.file, tmp_pdf)
+            tmp_pdf_path = tmp_pdf.name
+            tmp_pdf_size = tmp_pdf.tell()
     except Exception as e:
+        if tmp_pdf_path:
+            try:
+                os.unlink(tmp_pdf_path)
+            except Exception:
+                pass
         raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}")
 
-    if not pdf_bytes:
+    if tmp_pdf_size == 0:
+        os.unlink(tmp_pdf_path)
         raise HTTPException(status_code=422, detail="Empty PDF file")
 
-    # Open PDF with PyMuPDF
+    # Open PDF with PyMuPDF from disk path — no in-memory stream copy
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(tmp_pdf_path)
     except Exception as e:
+        os.unlink(tmp_pdf_path)
         raise HTTPException(
             status_code=422,
             detail=f"Corrupt or invalid PDF: {e}",
         )
 
     if len(doc) == 0:
+        doc.close()
+        os.unlink(tmp_pdf_path)
         raise HTTPException(status_code=422, detail="PDF has no pages")
 
     try:
         # Stage 0 — Triage
         logger.info(f"Processing PDF: {pdf.filename}, {len(doc)} pages")
-
-        # Write PDF bytes to a temp file (triage and count_heads both expect a path string)
-        tmp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        tmp_pdf.write(pdf_bytes)
-        tmp_pdf.close()
-        tmp_pdf_path = tmp_pdf.name
 
         page_routes = triage_pdf(tmp_pdf_path)
         logger.info(
@@ -127,7 +135,6 @@ async def count_sprinkler_heads(
         # before count_heads opens its own handle on the same file.
         page_dims = [(doc[i].rect.width, doc[i].rect.height) for i in range(len(doc))]
         doc.close()
-        del pdf_bytes  # free the raw bytes too
 
         results: list = []
 

@@ -3,7 +3,7 @@ services:
     name: rizer-count-service
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
