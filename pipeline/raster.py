@@ -11,8 +11,11 @@ from .nms import non_max_suppression
 
 logger = logging.getLogger(__name__)
 
+# Canonical template window size (px)
+TEMPLATE_WINDOW = (48, 48)
 
-def rasterize_page(page: fitz.Page, dpi: int = 200) -> np.ndarray:
+
+def rasterize_page(page: fitz.Page, dpi: int = 300) -> np.ndarray:
     """
     Rasterize a PDF page to a grayscale numpy array.
 
@@ -113,7 +116,7 @@ def run_template_matching(
     page: fitz.Page,
     templates: Dict[str, np.ndarray],
     threshold: float = 0.80,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> Dict[str, List[Tuple[int, int, float]]]:
     """
     Run template matching for all templates on a rasterized page.
@@ -134,9 +137,17 @@ def run_template_matching(
     score_histogram: Dict[str, List[float]] = {}
 
     for cluster_id, template in templates.items():
+        # Bug 2 guard: template acquisition check
+        if template is None or template.size == 0:
+            logger.warning(f"No template acquired for page — skipping Path B match for cluster {cluster_id}")
+            raise ValueError("Path B template acquisition failed — no symbol crop available")
+
         # Also preprocess template
         if template.ndim == 3:
             template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+
+        # Resize template to canonical TEMPLATE_WINDOW (48x48 px)
+        template = cv2.resize(template, TEMPLATE_WINDOW, interpolation=cv2.INTER_AREA)
 
         template_processed = preprocess_image(template)
         matches = match_heads(sheet_processed, template_processed, threshold=threshold)

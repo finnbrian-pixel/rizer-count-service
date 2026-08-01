@@ -172,8 +172,8 @@ async def count_sprinkler_heads(
 
                     if templates:
                         matches = run_template_matching(page, templates)
-                        # Get page dimensions in pixels at 200 DPI
-                        dpi = 200
+                        # Get page dimensions in pixels at 300 DPI
+                        dpi = 300
                         zoom = dpi / 72.0
                         px_width = int(page_width * zoom)
                         px_height = int(page_height * zoom)

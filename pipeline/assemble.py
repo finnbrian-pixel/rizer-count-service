@@ -216,10 +216,34 @@ def assemble_counts(
                     f"({discrepancy:.1%} difference)"
                 )
 
+    # Bug 3: Silent zero is a critical failure mode
+    total = sum(item["count"] for item in counts_list)
+    if total == 0:
+        return {
+            "sheet": sheet_name,
+            "total_heads": 0,
+            "confidence": 0.0,
+            "needs_verification": True,
+            "flags": flags + ["Zero heads detected — verify this is not a counting failure before using this result"],
+            "counts": counts_list,
+            "path_used": path_used,
+            "overlay": {
+                "positions": [],
+                "page_width": page_width,
+                "page_height": page_height,
+                "color_coding": {
+                    "high_confidence": "green",
+                    "low_confidence": "amber",
+                    "threshold": 0.85,
+                },
+                "low_confidence_positions": [],
+            },
+        }
+
     result: Dict[str, Any] = {
         "sheet": sheet_name,
         "counts": counts_list,
-        "total_heads": sum(item["count"] for item in counts_list),
+        "total_heads": total,
         "flags": flags,
         "confidence": confidence,
         "path_used": path_used,
