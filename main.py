@@ -13,24 +13,13 @@ import traceback
 from typing import Any, Dict, Optional
 
 import fitz  # PyMuPDF
-import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from pipeline.assemble import assemble_counts
-from pipeline.classify import classify_clusters, render_legend_region
-from pipeline.raster import (
-    get_raster_positions_normalized,
-    rasterize_page,
-    run_template_matching,
-)
 from pipeline.triage import triage_pdf
-from pipeline.vector import (
-    extract_vector_clusters,
-    get_cluster_positions,
-    render_cluster_sample,
-)
+from pipeline.vector import count_heads, count_in_region
 
 # Configure logging
 logging.basicConfig(
@@ -73,10 +62,9 @@ async def count_sprinkler_heads(
 
     Pipeline:
     1. Triage pages (vector vs raster)
-    2. Extract/detect symbols
-    3. Classify via Claude (legend only)
-    4. Assemble deterministic counts
-    5. Return overlay data for verification UI
+    2. Extract/detect symbols via count_heads (vector) or template matching (raster)
+    3. Assemble deterministic counts
+    4. Return overlay data for verification UI
 
     Accepts optional `corrections` JSON from prior user verification.
     """
@@ -124,7 +112,7 @@ async def count_sprinkler_heads(
         # Stage 0 — Triage
         logger.info(f"Processing PDF: {pdf.filename}, {len(doc)} pages")
 
-        # Write PDF bytes to a temp file for triage (expects a file path string)
+        # Write PDF bytes to a temp file (triage and count_heads both expect a path string)
         tmp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         tmp_pdf.write(pdf_bytes)
         tmp_pdf.close()
@@ -149,107 +137,57 @@ async def count_sprinkler_heads(
                 f"(page={page_width:.0f}x{page_height:.0f} pt)"
             )
 
-            vector_positions = None
-            raster_positions = None
-            cluster_samples: Dict[str, bytes] = {}
+            vector_count_result = None
 
-            # Stage 1A — Vector Extraction
+            # Stage 1A — Vector Counting
             if route in ("vector", "hybrid"):
-                clusters = extract_vector_clusters(page)
-                if clusters:
-                    vector_positions = get_cluster_positions(
-                        clusters, page_width, page_height
-                    )
-                    # Render first instance of each cluster for classification
-                    for fp, instances in clusters.items():
-                        if instances:
-                            bbox = instances[0]["bbox"]
-                            try:
-                                sample_png = render_cluster_sample(page, bbox)
-                                cluster_samples[fp] = sample_png
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to render sample for cluster {fp}: {e}"
-                                )
-
-            # Stage 1B — Template Matching (raster path)
-            if route in ("raster", "hybrid"):
-                # For raster path, we need templates
-                # If we have vector clusters, use their rendered samples as templates
-                if cluster_samples:
-                    import cv2
-
-                    templates: Dict[str, np.ndarray] = {}
-                    for cid, png_bytes in cluster_samples.items():
-                        img_array = np.frombuffer(png_bytes, dtype=np.uint8)
-                        img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-                        if img is not None:
-                            templates[cid] = img
-
-                    if templates:
-                        matches = run_template_matching(page, templates)
-                        # Get page dimensions in pixels at 300 DPI
-                        dpi = 300
-                        zoom = dpi / 72.0
-                        px_width = int(page_width * zoom)
-                        px_height = int(page_height * zoom)
-                        raster_positions = get_raster_positions_normalized(
-                            matches, px_width, px_height
-                        )
-                else:
-                    logger.warning(
-                        f"{sheet_name}: Raster path but no templates available. "
-                        "Skipping template matching."
-                    )
-
-            # Stage 3 — AI Legend Classification
-            classification = None
-            if cluster_samples:
                 try:
-                    legend_png = render_legend_region(page)
-                    classification = classify_clusters(legend_png, cluster_samples)
-                except EnvironmentError as e:
-                    # No API key — skip classification, use defaults
-                    logger.warning(f"Classification skipped: {e}")
-                    classification = {
-                        "legend_entries": [],
-                        "cluster_classification": [
-                            {
-                                "cluster_id": cid,
-                                "classification": "sprinkler_head",
-                                "head_type": "unknown",
-                                "confidence": 0.5,
-                            }
-                            for cid in cluster_samples.keys()
-                        ],
-                    }
+                    vector_count_result = count_heads(tmp_pdf_path, page_no=page_idx)
+                    logger.info(
+                        f"{sheet_name}: count_heads -> {vector_count_result['total']} heads "
+                        f"(confidence={vector_count_result['confidence']:.2f})"
+                    )
                 except Exception as e:
-                    logger.error(f"Classification failed: {e}")
-                    classification = {
-                        "legend_entries": [],
-                        "cluster_classification": [
-                            {
-                                "cluster_id": cid,
-                                "classification": "sprinkler_head",
-                                "head_type": "unknown",
-                                "confidence": 0.5,
-                            }
-                            for cid in cluster_samples.keys()
-                        ],
-                        "error": str(e),
-                    }
+                    logger.error(f"{sheet_name}: count_heads failed: {e}")
 
-            # Stage 4 — Count Assembly
-            page_result = assemble_counts(
-                vector_positions=vector_positions,
-                raster_positions=raster_positions,
-                classification=classification,
-                page_width=page_width,
-                page_height=page_height,
-                sheet_name=sheet_name,
-                path_used=route,
-                corrections=corrections_dict,
-            )
+            # Stage 1B — Raster path
+            if route in ("raster", "hybrid") and vector_count_result is None:
+                # Pure raster path: no vector result available.
+                # Template matching without cluster samples is not supported;
+                # fall through to assemble_counts with no positions so the
+                # caller receives needs_verification=True and can prompt the user.
+                logger.warning(
+                    f"{sheet_name}: Raster path active but no vector result available. "
+                    "Skipping template matching — needs_verification will be set."
+                )
+
+            # Stage 2 — Build page result
+            if vector_count_result is not None:
+                # Build the page result directly from count_heads output.
+                # This covers vector and hybrid routes.
+                page_result = {
+                    "sheet_name": sheet_name,
+                    "total_heads": vector_count_result["total"],
+                    "counts": vector_count_result["counts"],
+                    "heads": vector_count_result["heads"],
+                    "rejected": vector_count_result["rejected"],
+                    "confidence": vector_count_result["confidence"],
+                    "needs_verification": vector_count_result["needs_verification"],
+                    "path_used": route,
+                    "method": vector_count_result.get("method", "vector-geometric"),
+                }
+            else:
+                # Raster-only fallback: assemble with no positions
+                page_result = assemble_counts(
+                    vector_positions=None,
+                    raster_positions=None,
+                    classification=None,
+                    page_width=page_width,
+                    page_height=page_height,
+                    sheet_name=sheet_name,
+                    path_used=route,
+                    corrections=corrections_dict,
+                )
 
             results.append(page_result)
 
