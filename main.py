@@ -123,13 +123,17 @@ async def count_sprinkler_heads(
             f"Triage results: {[(i, r['path'], r['reason']) for i, r in enumerate(page_routes)]}"
         )
 
+        # Collect page dimensions upfront, then close the doc to free memory
+        # before count_heads opens its own handle on the same file.
+        page_dims = [(doc[i].rect.width, doc[i].rect.height) for i in range(len(doc))]
+        doc.close()
+        del pdf_bytes  # free the raw bytes too
+
         results: list = []
 
         for page_idx, triage_result in enumerate(page_routes):
             route = triage_result["path"]
-            page = doc[page_idx]
-            page_width = page.rect.width
-            page_height = page.rect.height
+            page_width, page_height = page_dims[page_idx]
             sheet_name = f"SHEET-{page_idx + 1}"
 
             logger.info(
@@ -243,7 +247,12 @@ async def count_sprinkler_heads(
             },
         )
     finally:
-        doc.close()
+        # doc already closed above after collecting page dims;
+        # guard in case of early exception before that point.
+        try:
+            doc.close()
+        except Exception:
+            pass
         # Clean up temp file
         try:
             os.unlink(tmp_pdf_path)

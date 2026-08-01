@@ -39,12 +39,24 @@ def _q(v, step=SIZE_QUANT_PT):
 
 
 def element_of(d):
-    r = fitz.Rect(d["rect"])
+    rect = d["rect"]
+    # Handle both tuple (from get_cdrawings) and Rect (from get_drawings)
+    if isinstance(rect, tuple):
+        r = fitz.Rect(rect)
+    else:
+        r = fitz.Rect(rect)
     angles = []
     for it in d["items"]:
         if it[0] == "l":
             p1, p2 = it[1], it[2]
-            a = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x)) % 180.0
+            # Handle both Point objects and tuples
+            if isinstance(p1, tuple):
+                dy = p2[1] - p1[1]
+                dx = p2[0] - p1[0]
+            else:
+                dy = p2.y - p1.y
+                dx = p2.x - p1.x
+            a = math.degrees(math.atan2(dy, dx)) % 180.0
             angles.append(round(a, 0))
     return {
         "rect": r,
@@ -61,12 +73,20 @@ def element_of(d):
 
 
 def small_elements(page, max_pt=22.0):
+    """Return (elements_list, total_drawings_count) to avoid calling get_drawings() twice.
+    Uses get_cdrawings(extended=True) for lower memory overhead (tuples vs Point objects).
+    """
+    drawings = page.get_cdrawings(extended=True)
+    total_drawings = len(drawings)
     out = []
-    for d in page.get_drawings():
-        r = fitz.Rect(d["rect"])
-        if 1.0 < r.width < max_pt and 1.0 < r.height < max_pt:
+    for d in drawings:
+        rect = d["rect"]  # tuple (x0, y0, x1, y1) in cdrawings
+        w = rect[2] - rect[0]
+        h = rect[3] - rect[1]
+        if 1.0 < w < max_pt and 1.0 < h < max_pt:
             out.append(element_of(d))
-    return out
+    del drawings  # free the large list immediately
+    return out, total_drawings
 
 
 def passes_symbol_gate(e):
@@ -207,7 +227,7 @@ def count_heads(pdf_path, page_no=0, exclude_right_of=None,
                 circle_dia=(8.5, 9.2), tri_w=(7.3, 8.1), tri_h=(8.4, 9.2)):
     doc = fitz.open(pdf_path)
     page = doc[page_no]
-    elements = small_elements(page)
+    elements, drawings_on_page = small_elements(page)
     table, rows = find_legend(page)
     head_rows = legend_head_rows(rows)
     if exclude_right_of is None:
@@ -243,6 +263,7 @@ def count_heads(pdf_path, page_no=0, exclude_right_of=None,
 
     counts = Counter(h["class"] for h in heads)
     total = len(heads)
+    doc.close()
     return {
         "page": page_no,
         "total": total,
@@ -251,7 +272,7 @@ def count_heads(pdf_path, page_no=0, exclude_right_of=None,
         "rejected": dict(rejected),
         "legend_head_types": [short_label(r["description"]) for r in head_rows],
         "exclude_right_of": round(exclude_right_of, 1),
-        "drawings_on_page": len(page.get_drawings()),
+        "drawings_on_page": drawings_on_page,
         "small_elements": len(elements),
         "method": "vector-geometric",
         "confidence": 1.0 if total else 0.0,
@@ -272,6 +293,7 @@ def write_overlay(pdf_path, result, out_png, page_no=0, dpi=120, clip=None):
                          color=colors[h["class"]], width=1.8)
     page.set_cropbox(clip or fitz.Rect(0, 0, result["exclude_right_of"], page.rect.y1))
     page.get_pixmap(dpi=dpi).save(out_png)
+    doc.close()
     return colors
 
 
