@@ -40,7 +40,24 @@ def render_legend_region(
     Returns:
         PNG bytes of the rendered region.
     """
-    mat = fitz.Matrix(2, 2)  # 2x zoom for readability
+    MAX_LEGEND_PX = 40_000_000
+    zoom = 2.0
+    if not legend_bbox:
+        # Full page render — compute pixel budget BEFORE allocating pixmap
+        pw_pts = page.rect.width
+        ph_pts = page.rect.height
+        px_w = pw_pts * zoom
+        px_h = ph_pts * zoom
+        total_px = px_w * px_h
+        if total_px > MAX_LEGEND_PX:
+            scale = (MAX_LEGEND_PX / total_px) ** 0.5
+            zoom = max(1.0, zoom * scale)
+            logger.info(
+                f"Legend render budget: {total_px/1e6:.0f}M px at 2x, "
+                f"capping zoom to {zoom:.2f}x"
+            )
+
+    mat = fitz.Matrix(zoom, zoom)
     if legend_bbox:
         clip = fitz.Rect(*legend_bbox)
         pix = page.get_pixmap(matrix=mat, clip=clip)

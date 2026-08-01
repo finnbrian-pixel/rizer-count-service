@@ -131,6 +131,9 @@ async def count_sprinkler_heads(
         tmp_pdf_path = tmp_pdf.name
 
         page_routes = triage_pdf(tmp_pdf_path)
+        logger.info(
+            f"Triage results: {[(i, r['path'], r['reason']) for i, r in enumerate(page_routes)]}"
+        )
 
         results: list = []
 
@@ -141,7 +144,10 @@ async def count_sprinkler_heads(
             page_height = page.rect.height
             sheet_name = f"SHEET-{page_idx + 1}"
 
-            logger.info(f"Processing {sheet_name} via '{route}' path")
+            logger.info(
+                f"Processing {sheet_name} via '{route}' path "
+                f"(page={page_width:.0f}x{page_height:.0f} pt)"
+            )
 
             vector_positions = None
             raster_positions = None
@@ -256,12 +262,16 @@ async def count_sprinkler_heads(
             r.get("needs_verification", False) for r in results
         )
 
+        # Collect routing info for caller visibility
+        paths_used = [r.get("path_used", "unknown") for r in results]
+
         response = {
             "filename": pdf.filename,
             "pages_processed": len(results),
             "total_heads": total_heads,
             "confidence": overall_confidence,
             "needs_verification": any_needs_verification,
+            "path_used": paths_used[0] if len(set(paths_used)) == 1 else "mixed",
             "sheets": results,
         }
 
