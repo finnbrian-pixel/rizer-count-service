@@ -15,7 +15,6 @@ def estimate_legend_bbox(
     Estimate the legend/title block region (typically bottom-right of sheet).
     Returns (x0, y0, x1, y1) in page coordinates.
     """
-    # Convention: legend is typically in the bottom-right ~20% width, ~30% height
     x0 = page_width * 0.75
     y0 = page_height * 0.70
     x1 = page_width
@@ -42,7 +41,6 @@ def compute_confidence_from_scores(scores: List[float]) -> float:
         return 0.0
     mean_score = np.mean(scores)
     std_score = np.std(scores) if len(scores) > 1 else 0.0
-    # Confidence decreases with lower mean score and higher variance
     confidence = mean_score * (1.0 - min(std_score * 2, 0.3))
     return round(float(np.clip(confidence, 0.0, 1.0)), 4)
 
@@ -99,16 +97,13 @@ def assemble_counts(
     # Process vector positions
     if vector_positions:
         for cluster_id, positions in vector_positions.items():
-            # Get classification for this cluster
             cls_info = class_lookup.get(cluster_id, {})
             classification_type = cls_info.get("classification", "sprinkler_head")
             head_type = cls_info.get("head_type", "unknown")
 
-            # Only count sprinkler heads
             if classification_type != "sprinkler_head":
                 continue
 
-            # Filter out legend zone
             valid_positions: List[List[float]] = []
             excluded_count = 0
             for pos in positions:
@@ -121,7 +116,7 @@ def assemble_counts(
                     "y": pos[1],
                     "cluster_id": cluster_id,
                     "head_type": head_type,
-                    "confidence": 1.0,  # Vector = deterministic
+                    "confidence": 1.0,
                     "source": "vector",
                 })
 
@@ -176,7 +171,7 @@ def assemble_counts(
             if low_confidence_count > 0:
                 flags.append(
                     f"{low_confidence_count} template matches below 0.85 score "
-                    f"— highlight for verification"
+                    f"-- highlight for verification"
                 )
 
             if head_type not in counts_by_type:
@@ -201,12 +196,8 @@ def assemble_counts(
     # Check hybrid discrepancy
     needs_verification = False
     if path_used == "hybrid" and vector_positions and raster_positions:
-        vector_total = sum(
-            len(p) for p in vector_positions.values()
-        )
-        raster_total = sum(
-            len(d) for d in raster_positions.values()
-        )
+        vector_total = sum(len(p) for p in vector_positions.values())
+        raster_total = sum(len(d) for d in raster_positions.values())
         if vector_total > 0:
             discrepancy = abs(vector_total - raster_total) / vector_total
             if discrepancy > 0.02:
@@ -216,15 +207,19 @@ def assemble_counts(
                     f"({discrepancy:.1%} difference)"
                 )
 
-    # Bug 3: Silent zero is a critical failure mode
+    # Total count
     total = sum(item["count"] for item in counts_list)
+
+    # Silent zero is a critical failure mode
     if total == 0:
         return {
             "sheet": sheet_name,
             "total_heads": 0,
             "confidence": 0.0,
             "needs_verification": True,
-            "flags": flags + ["Zero heads detected — verify this is not a counting failure before using this result"],
+            "flags": flags + [
+                "Zero heads detected -- verify this is not a counting failure"
+            ],
             "counts": counts_list,
             "path_used": path_used,
             "overlay": {
@@ -240,6 +235,14 @@ def assemble_counts(
             },
         }
 
+    # Confidence guardrail
+    if confidence < 0.90:
+        needs_verification = True
+        if not any("confidence" in f.lower() for f in flags):
+            flags.append(
+                f"Low confidence ({confidence:.2f} < 0.90) -- needs human verification"
+            )
+
     result: Dict[str, Any] = {
         "sheet": sheet_name,
         "counts": counts_list,
@@ -247,10 +250,8 @@ def assemble_counts(
         "flags": flags,
         "confidence": confidence,
         "path_used": path_used,
+        "needs_verification": needs_verification,
     }
-
-    if needs_verification:
-        result["needs_verification"] = True
 
     # Stage 5 overlay data
     result["overlay"] = {
