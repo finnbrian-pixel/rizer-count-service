@@ -9,28 +9,86 @@ logger = logging.getLogger(__name__)
 
 DPI = 300  # hard floor — never lower
 
+MAX_PIXELS = 40_000_000  # 40 megapixels — hard ceiling
+
 # Blank-paper threshold: a real symbol has mean ~218 (dark ink on white).
 # Anything above 235 is blank paper and must be rejected.
 BLANK_THRESHOLD = 235
 
 
+def _apply_pixel_budget(page, dpi: int) -> int:
+    """
+    Given a PyMuPDF page and requested DPI, return the effective DPI
+    that keeps total pixel count under MAX_PIXELS.
+    """
+    pw_pts = page.rect.width
+    ph_pts = page.rect.height
+
+    # Pixels at requested DPI
+    px_w = pw_pts * dpi / 72.0
+    px_h = ph_pts * dpi / 72.0
+    total_px = px_w * px_h
+
+    # If over budget, scale down DPI to fit
+    effective_dpi = dpi
+    if total_px > MAX_PIXELS:
+        scale_factor = (MAX_PIXELS / total_px) ** 0.5
+        effective_dpi = max(72, int(dpi * scale_factor))
+        logger.warning(
+            f"Page would render to {int(total_px/1e6):.0f}M px at {dpi} DPI. "
+            f"Downscaling to {effective_dpi} DPI "
+            f"({int(px_w*scale_factor):.0f}x{int(px_h*scale_factor):.0f} px)"
+        )
+
+    return effective_dpi
+
+
 def rasterize(pdf_path: str, page_no: int = 0, dpi: int = DPI):
-    """Rasterize a PDF page to grayscale numpy array at `dpi`."""
+    """Rasterize a PDF page to grayscale numpy array at `dpi`.
+    
+    Returns:
+        (gray, effective_dpi) — the grayscale image and the actual DPI used
+        (may be lower than requested if the pixel budget cap was applied).
+    """
     doc = fitz.open(pdf_path)
-    pix = doc[page_no].get_pixmap(dpi=dpi)
+    page = doc[page_no]
+
+    # Apply pixel budget cap
+    effective_dpi = _apply_pixel_budget(page, dpi)
+
+    pix = page.get_pixmap(dpi=effective_dpi)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if pix.n >= 3 else img.copy()
-    logger.info(f"Rasterized page {page_no} at {dpi} DPI -> {gray.shape}")
-    return gray
+
+    # Always log final render dimensions and effective DPI
+    logger.info(
+        f"Rasterized page {page_no}: {gray.shape[1]}x{gray.shape[0]} px "
+        f"at effective {effective_dpi} DPI (requested {dpi} DPI, "
+        f"budget {MAX_PIXELS/1e6:.0f}M px)"
+    )
+    return gray, effective_dpi
 
 
 def rasterize_page(page: fitz.Page, dpi: int = DPI):
-    """Rasterize a PyMuPDF page object to grayscale numpy array."""
-    pix = page.get_pixmap(dpi=dpi)
+    """Rasterize a PyMuPDF page object to grayscale numpy array.
+    
+    Returns:
+        (gray, effective_dpi) — the grayscale image and the actual DPI used
+        (may be lower than requested if the pixel budget cap was applied).
+    """
+    # Apply pixel budget cap
+    effective_dpi = _apply_pixel_budget(page, dpi)
+
+    pix = page.get_pixmap(dpi=effective_dpi)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if pix.n >= 3 else img.copy()
-    logger.info(f"Rasterized page at {dpi} DPI -> {gray.shape}")
-    return gray
+
+    logger.info(
+        f"Rasterized page: {gray.shape[1]}x{gray.shape[0]} px "
+        f"at effective {effective_dpi} DPI (requested {dpi} DPI, "
+        f"budget {MAX_PIXELS/1e6:.0f}M px)"
+    )
+    return gray, effective_dpi
 
 
 def _fingerprint_blob(crop: np.ndarray) -> str:
@@ -287,7 +345,7 @@ def run_template_matching(
     Returns:
         Dict of cluster_id -> list of (x, y, w, h, score) detections.
     """
-    sheet_gray = rasterize_page(page, dpi=dpi)
+    sheet_gray, effective_dpi = rasterize_page(page, dpi=dpi)
     results = {}
 
     for cluster_id, tpl in templates.items():

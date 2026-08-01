@@ -104,7 +104,7 @@ def run_test():
     page_w_pts, page_h_pts = create_test_pdf(pdf_path, n_heads=175, n_legend=2)
 
     # Rasterize
-    sheet_gray = rasterize(pdf_path, page_no=0, dpi=300)
+    sheet_gray, effective_dpi = rasterize(pdf_path, page_no=0, dpi=300)
     logger.info(f"Sheet: {sheet_gray.shape}, mean={sheet_gray.mean():.1f}")
 
     # Test 1: crop_template with intentionally BAD bbox (top-left, blank area)

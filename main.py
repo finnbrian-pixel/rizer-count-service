@@ -264,11 +264,25 @@ async def count_sprinkler_heads(
 
     except HTTPException:
         raise
+    except MemoryError:
+        logger.error("OOM: PDF raster resolution exceeds memory limits")
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "File too large to process",
+                "reason": "PDF raster resolution exceeds memory limits even after downscaling",
+                "needs_verification": True,
+            },
+        )
     except Exception as e:
-        logger.error(f"Pipeline error: {traceback.format_exc()}")
-        raise HTTPException(
+        logger.exception("Pipeline failed")
+        return JSONResponse(
             status_code=500,
-            detail=f"Pipeline processing failed: {str(e)}",
+            content={
+                "error": "Processing failed",
+                "reason": str(e),
+                "needs_verification": True,
+            },
         )
     finally:
         doc.close()
