@@ -80,12 +80,35 @@ def descriptor(e):
     return (e["kinds"], e["w"], e["h"], e["filled"], e["angles"])
 
 
-def small_elements(page, max_pt=30.0):
-    """Stream drawings; keep only small ones. Never materialize the full list.
+USE_STREAM = True   # parse the content stream instead of materializing paths
 
-    page.get_drawings() on a dense sheet returns ~92k dicts. Binding that to a
-    name (or calling it twice) is what put this over a 512MB container.
+
+def _boxes(page, min_w, min_h):
+    """Larger drawn rectangles, streamed."""
+    if USE_STREAM:
+        try:
+            import stream_extract
+            return list(stream_extract.stream_boxes(page, min_w, min_h))
+        except Exception:
+            pass
+    return [tuple(d["rect"]) for d in page.get_cdrawings()
+            if d["rect"][2] - d["rect"][0] >= min_w
+            and d["rect"][3] - d["rect"][1] >= min_h]
+
+
+def small_elements(page, max_pt=30.0):
+    """Small drawn elements only.
+
+    Default path parses the raw content stream incrementally, discarding
+    oversized paths as soon as their bbox is known. On a dense Revit export
+    (1.2M paths) that is ~123 MB peak instead of ~1.8 GB for get_cdrawings().
     """
+    if USE_STREAM:
+        try:
+            import stream_extract
+            return list(stream_extract.stream_elements(page, max_pt=max_pt))
+        except Exception:
+            pass   # fall back to the materializing path
     out = []
     for d in page.get_cdrawings():
         x0, y0, x1, y1 = d["rect"]
@@ -174,11 +197,8 @@ def _table_box(page, hit):
     page_area = page.rect.width * page.rect.height
     title_w = hit.x1 - hit.x0
     best = None
-    for d in page.get_cdrawings():
-        x0, y0, x1, y1 = d["rect"]
+    for x0, y0, x1, y1 in _boxes(page, 80, 30):
         w, h = x1 - x0, y1 - y0
-        if w < 80 or h < 30:
-            continue
         # sanity: a legend box is not the sheet border
         if w > title_w * 3.5 or h > 520 or w * h > page_area * 0.10:
             continue
@@ -247,10 +267,9 @@ def detail_zones(page):
                 labels.append(fitz.Rect(l["bbox"]))
     if not labels:
         return zones
-    for d in page.get_cdrawings():
-        x0, y0, x1, y1 = d["rect"]
+    for x0, y0, x1, y1 in _boxes(page, 60, 40):
         w, h = x1 - x0, y1 - y0
-        if w < 60 or h < 40 or w * h > page_area * 0.10:
+        if w * h > page_area * 0.10:
             continue
         r = fitz.Rect(x0, y0, x1, y1)
         for lab in labels:
