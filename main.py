@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from pipeline.assemble import assemble_counts
 from pipeline.triage import triage_pdf
-from pipeline.vector import count_heads, count_in_region
+from hc2 import count_page as count_heads, count_in_region
 
 # Configure logging
 logging.basicConfig(
