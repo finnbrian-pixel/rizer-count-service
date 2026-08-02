@@ -61,6 +61,7 @@ async def render_and_upload_page(pdf_path: str, page_no: int = 0) -> str | None:
         doc.close()
 
         img_bytes = pix.tobytes("png")
+        del pix  # free 85MB pixmap before upload
 
         supabase_url = os.environ.get("SUPABASE_URL")
         service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
