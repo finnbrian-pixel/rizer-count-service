@@ -7,6 +7,7 @@ runtime and uses them as the match targets, so it works on drawing sets it has
 never seen without tuning.
 """
 
+import hashlib
 import math
 import re
 from collections import defaultdict, Counter
@@ -50,6 +51,11 @@ def _q(v, step=SIZE_QUANT_PT):
 
 def _qa(a):
     return round(a / ANGLE_QUANT_DEG) * ANGLE_QUANT_DEG % 180
+
+
+def _sig_hash(sig_tuple):
+    """Stable 8-char hex hash of a cluster signature tuple."""
+    return hashlib.sha256(str(sig_tuple).encode()).hexdigest()[:8]
 
 
 def element_of(d):
@@ -438,9 +444,10 @@ def count_page(pdf_path, page_no=0, extra_symbols=None):
             continue
         sig, cx, cy = cluster_signature(e, idx, cell, noise_floor)
         if sig in learned:
-            found.append({"cx": cx, "cy": cy, "type": learned[sig]})
+            found.append({"cx": cx, "cy": cy, "type": learned[sig], "sig_hash": _sig_hash(sig)})
 
-    heads = [{"x": round(f["cx"], 1), "y": round(f["cy"], 1), "type": f["type"]}
+    heads = [{"x": round(f["cx"], 1), "y": round(f["cy"], 1),
+             "type": f["type"], "signature_hash": f["sig_hash"]}
              for f in dedupe_coincident(found, tol=CONCENTRIC_TOL_PT)]
 
     result.update({

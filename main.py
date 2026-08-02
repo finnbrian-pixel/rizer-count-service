@@ -11,6 +11,9 @@ import os
 import shutil
 import tempfile
 import traceback
+import uuid
+
+import httpx
 from typing import Any, Dict, Optional
 
 import fitz  # PyMuPDF
@@ -43,6 +46,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+async def render_and_upload_page(pdf_path: str, page_no: int = 0) -> str | None:
+    """Render page at 150 DPI, upload to Supabase storage, return public URL."""
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_no]
+
+        # 150 DPI is safe — a 30x42 sheet is ~6250x4375 = 27M pixels, well under cap
+        mat = fitz.Matrix(150 / 72, 150 / 72)
+        pix = page.get_pixmap(matrix=mat)
+        doc.close()
+
+        img_bytes = pix.tobytes("png")
+
+        supabase_url = os.environ.get("SUPABASE_URL")
+        service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+        if not supabase_url or not service_key:
+            return None
+
+        file_name = f"sheet_previews/{uuid.uuid4()}.png"
+        upload_url = f"{supabase_url}/storage/v1/object/blueprints/{file_name}"
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                upload_url,
+                content=img_bytes,
+                headers={
+                    "Authorization": f"Bearer {service_key}",
+                    "Content-Type": "image/png",
+                },
+            )
+
+        if resp.status_code in (200, 201):
+            return f"{supabase_url}/storage/v1/object/public/blueprints/{file_name}"
+        return None
+    except Exception:
+        return None
 
 
 @app.get("/health")
@@ -223,6 +266,14 @@ async def count_sprinkler_heads(
             "path_used": paths_used[0] if len(set(paths_used)) == 1 else "mixed",
             "sheets": results,
         }
+
+        # Render page image for UI overlay (best-effort, never blocks count)
+        page_image_url = None
+        try:
+            page_image_url = await render_and_upload_page(tmp_pdf_path, page_no=0)
+        except Exception:
+            pass
+        response["page_image_url"] = page_image_url
 
         logger.info(
             f"Completed: {pdf.filename} — {total_heads} heads across "
