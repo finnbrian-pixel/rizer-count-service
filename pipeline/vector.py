@@ -157,13 +157,43 @@ def find_legend(page):
         if not m:
             continue
         for hit in page.search_for(m.group(0)):
-            table = fitz.Rect(hit.x0 - 30, hit.y1,
-                              min(hit.x1 + 120, page.rect.x1),
-                              min(hit.y1 + 700, page.rect.y1))
+            table = _table_box(page, hit)
             rows = _rows_in(page, table)
             if len(rows) >= 2:
                 return hit, table, rows
     return None, None, []
+
+
+def _table_box(page, hit):
+    """Bound the legend by the rectangle drawn around it.
+
+    A fixed-height window swallows whatever sits below the legend -- general
+    notes, schedules -- and their text hijacks the description-column
+    detection. Most legends are boxed; use that box when present.
+    """
+    page_area = page.rect.width * page.rect.height
+    title_w = hit.x1 - hit.x0
+    best = None
+    for d in page.get_cdrawings():
+        x0, y0, x1, y1 = d["rect"]
+        w, h = x1 - x0, y1 - y0
+        if w < 80 or h < 30:
+            continue
+        # sanity: a legend box is not the sheet border
+        if w > title_w * 3.5 or h > 520 or w * h > page_area * 0.10:
+            continue
+        if not (x0 - 6 <= hit.x0 and x1 + 6 >= hit.x1
+                and y0 - 6 <= hit.y0 and y1 + 6 >= hit.y1):
+            continue
+        area = w * h
+        if best is None or area < best[0]:
+            best = (area, fitz.Rect(x0, y0, x1, y1))
+    if best:
+        return best[1]
+    # no enclosing box: stop at the first large vertical gap below the title
+    return fitz.Rect(hit.x0 - 30, hit.y1,
+                     min(hit.x1 + 140, page.rect.x1),
+                     min(hit.y1 + 260, page.rect.y1))
 
 
 def _rows_in(page, table):
@@ -196,6 +226,43 @@ def _rows_in(page, table):
              "desc_x": desc_x,
              "sym_x0": table.x0,
              "description": " ".join(l[3] for l in b)} for b in bands]
+
+
+DETAIL_RE = re.compile(r"\bDETAIL\b", re.I)
+
+
+def detail_zones(page):
+    """Boxed detail callouts drawn on a plan sheet.
+
+    Details show sample heads at plan scale. They are not installed heads and
+    must not be counted; a boxed region labelled DETAIL is the reliable marker.
+    """
+    zones = []
+    page_area = page.rect.width * page.rect.height
+    labels = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            txt = "".join(s["text"] for s in l["spans"])
+            if DETAIL_RE.search(txt):
+                labels.append(fitz.Rect(l["bbox"]))
+    if not labels:
+        return zones
+    for d in page.get_cdrawings():
+        x0, y0, x1, y1 = d["rect"]
+        w, h = x1 - x0, y1 - y0
+        if w < 60 or h < 40 or w * h > page_area * 0.10:
+            continue
+        r = fitz.Rect(x0, y0, x1, y1)
+        for lab in labels:
+            if r.x0 - 6 <= lab.x0 and r.x1 + 6 >= lab.x1 and r.y0 - 6 <= lab.y0 and r.y1 + 6 >= lab.y1:
+                zones.append(r)
+                break
+    # keep only the smallest box around each label
+    keep = []
+    for z in sorted(zones, key=lambda r: r.get_area()):
+        if not any(k.contains(z) for k in keep):
+            keep.append(z)
+    return keep
 
 
 def is_head_row(desc):
@@ -302,12 +369,15 @@ def dedupe_coincident(items, tol=COINCIDENT_TOL_PT):
     return out
 
 
-def count_page(pdf_path, page_no=0):
+def count_page(pdf_path, page_no=0, extra_symbols=None):
     doc = fitz.open(pdf_path)
     page = doc[page_no]
     elements = small_elements(page)
     anchor, table, rows = find_legend(page)
     learned = learn_symbols(page, table, rows, elements) if table else {}
+    if extra_symbols:
+        for sig, label in extra_symbols.items():
+            learned.setdefault(sig, label)
 
     # Exclude the legend TABLE RECTANGLE, not a half-plane: legends appear on
     # the left as often as the right, and a half-plane rule wipes the sheet.
@@ -316,6 +386,7 @@ def count_page(pdf_path, page_no=0):
         rows_y1 = max((r["y1"] for r in rows), default=table.y1)
         zones.append(fitz.Rect(table.x0 - 8, min(table.y0, anchor.y0) - 8,
                                table.x1 + 8, max(rows_y1, table.y0) + 8))
+    zones.extend(detail_zones(page))
 
     def excluded(e):
         return any(z.x0 <= e["cx"] <= z.x1 and z.y0 <= e["cy"] <= z.y1 for z in zones)
@@ -365,17 +436,81 @@ def count_page(pdf_path, page_no=0):
     return result
 
 
-def count_document(pdf_path):
+def count_page_validated(pdf_path, page_no=0, hazard=None):
+    """Count, then validate against the drawing's own declared physics.
+
+    Confidence is the product of the geometric result and the physics verdict,
+    so an implausible count cannot come back looking trustworthy.
+    """
+    import physics
+    r = count_page(pdf_path, page_no)
+    p = physics.check(pdf_path, r, page_no, hazard)
+    r["physics"] = p
+    r["confidence"] = round(r.get("confidence", 0.0) * p["confidence_multiplier"], 3)
+    r["needs_verification"] = r.get("needs_verification", False) or p["needs_verification"]
+    return r
+
+
+def learn_document_symbols(pdf_path):
+    """Pass 1: pool head symbols from every sheet that carries a legend.
+
+    Drawing sets routinely put the legend on its own sheet (F001) and the
+    plans on others (F101, F102). Counting each sheet in isolation makes those
+    plan sheets return zero -- they have nothing to learn from.
+    """
+    doc = fitz.open(pdf_path)
+    pooled, sources = {}, []
+    for i in range(len(doc)):
+        page = doc[i]
+        elements = small_elements(page)
+        anchor, table, rows = find_legend(page)
+        if not table:
+            continue
+        learned = learn_symbols(page, table, rows, elements)
+        if learned:
+            for sig, label in learned.items():
+                pooled.setdefault(sig, label)
+            sources.append({"page": i, "types": sorted(set(learned.values()))})
+    doc.close()
+    return pooled, sources
+
+
+def count_document(pdf_path, validate=True):
+    """Two-pass: learn symbols across the whole set, then count each sheet."""
+    pooled, sources = learn_document_symbols(pdf_path)
     doc = fitz.open(pdf_path)
     n = len(doc)
     doc.close()
-    pages = [count_page(pdf_path, i) for i in range(n)]
-    total = sum(p["total"] for p in pages)
+
+    pages = []
+    for i in range(n):
+        p = count_page(pdf_path, i, extra_symbols=pooled)
+        if validate and p["total"]:
+            try:
+                import physics
+                ph = physics.check(pdf_path, p, i)
+                p["physics"] = ph
+                p["confidence"] = round(p["confidence"] * ph["confidence_multiplier"], 3)
+                p["needs_verification"] = p["needs_verification"] or ph["needs_verification"]
+            except Exception as e:
+                p["physics"] = {"verdict": "UNKNOWN", "error": str(e)}
+        pages.append(p)
+
     agg = Counter()
     for p in pages:
         agg.update(p["counts"])
-    return {"file": pdf_path, "pages": pages, "document_total": total,
-            "document_counts": dict(agg)}
+    plan_pages = [p for p in pages if p["sheet_kind"] == "plan"]
+    return {
+        "file": pdf_path,
+        "sheets": n,
+        "legend_sources": sources,
+        "pooled_symbol_types": sorted(set(pooled.values())),
+        "pages": pages,
+        "plan_sheets": [p["page"] for p in plan_pages],
+        "document_total": sum(p["total"] for p in pages),
+        "document_counts": dict(agg),
+        "needs_verification": any(p["needs_verification"] for p in plan_pages) or not plan_pages,
+    }
 
 
 def count_in_region(result, x0, y0, x1, y1):
