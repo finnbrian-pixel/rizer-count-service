@@ -303,8 +303,13 @@ def learn_symbols(page, table, rows, elements):
     For each head row, take the drawn elements in the symbol column and
     register a signature for every element treated as core. Registering all
     of them removes the legend-vs-plan 'which element is the core' mismatch.
+
+    Returns (learned, base_sigs) where learned maps every variant signature
+    to its label and base_sigs is the set of signatures that matched without
+    any rotation/mirror (the canonical legend orientation).
     """
     learned = {}
+    base_sigs = set()
     for row in rows:
         if not is_head_row(row["description"]):
             continue
@@ -316,11 +321,12 @@ def learn_symbols(page, table, rows, elements):
         idx, cell = build_index(parts)
         label = short_label(row["description"])
         sig = tuple(sorted(descriptor(p) for p in collapse(parts)))
+        base_sigs.add(sig)
         for variant in orientation_variants(sig):
             learned.setdefault(variant, label)
         row["measured"] = [(p["kinds"], round(p["raw_w"], 1), round(p["raw_h"], 1),
                             p["filled"], p["angles"]) for p in parts]
-    return learned
+    return learned, base_sigs
 
 
 def _rot_desc(d, k, mirror):
@@ -394,15 +400,20 @@ def dedupe_coincident(items, tol=COINCIDENT_TOL_PT):
     return out
 
 
-def count_page(pdf_path, page_no=0, extra_symbols=None):
+def count_page(pdf_path, page_no=0, extra_symbols=None, extra_base_sigs=None):
     doc = fitz.open(pdf_path)
     page = doc[page_no]
     elements = small_elements(page)
     anchor, table, rows = find_legend(page)
-    learned = learn_symbols(page, table, rows, elements) if table else {}
+    if table:
+        learned, base_sigs = learn_symbols(page, table, rows, elements)
+    else:
+        learned, base_sigs = {}, set()
     if extra_symbols:
         for sig, label in extra_symbols.items():
             learned.setdefault(sig, label)
+    if extra_base_sigs:
+        base_sigs.update(extra_base_sigs)
 
     # Exclude the legend TABLE RECTANGLE, not a half-plane: legends appear on
     # the left as often as the right, and a half-plane rule wipes the sheet.
@@ -444,10 +455,13 @@ def count_page(pdf_path, page_no=0, extra_symbols=None):
             continue
         sig, cx, cy = cluster_signature(e, idx, cell, noise_floor)
         if sig in learned:
-            found.append({"cx": cx, "cy": cy, "type": learned[sig], "sig_hash": _sig_hash(sig)})
+            # Per-detection confidence: base signature = 0.95, orientation variant = 0.85
+            conf = 0.95 if sig in base_sigs else 0.85
+            found.append({"cx": cx, "cy": cy, "type": learned[sig], "sig_hash": _sig_hash(sig), "confidence": conf})
 
     heads = [{"x": round(f["cx"], 1), "y": round(f["cy"], 1),
-             "type": f["type"], "signature_hash": f["sig_hash"]}
+             "type": f["type"], "signature_hash": f["sig_hash"],
+             "confidence": f.get("confidence", 0.95)}
              for f in dedupe_coincident(found, tol=CONCENTRIC_TOL_PT)]
 
     result.update({
@@ -485,32 +499,33 @@ def learn_document_symbols(pdf_path):
     plan sheets return zero -- they have nothing to learn from.
     """
     doc = fitz.open(pdf_path)
-    pooled, sources = {}, []
+    pooled, pooled_base_sigs, sources = {}, set(), []
     for i in range(len(doc)):
         page = doc[i]
         elements = small_elements(page)
         anchor, table, rows = find_legend(page)
         if not table:
             continue
-        learned = learn_symbols(page, table, rows, elements)
+        learned, base_sigs = learn_symbols(page, table, rows, elements)
         if learned:
             for sig, label in learned.items():
                 pooled.setdefault(sig, label)
+            pooled_base_sigs.update(base_sigs)
             sources.append({"page": i, "types": sorted(set(learned.values()))})
     doc.close()
-    return pooled, sources
+    return pooled, pooled_base_sigs, sources
 
 
 def count_document(pdf_path, validate=True):
     """Two-pass: learn symbols across the whole set, then count each sheet."""
-    pooled, sources = learn_document_symbols(pdf_path)
+    pooled, pooled_base_sigs, sources = learn_document_symbols(pdf_path)
     doc = fitz.open(pdf_path)
     n = len(doc)
     doc.close()
 
     pages = []
     for i in range(n):
-        p = count_page(pdf_path, i, extra_symbols=pooled)
+        p = count_page(pdf_path, i, extra_symbols=pooled, extra_base_sigs=pooled_base_sigs)
         if validate and p["total"]:
             try:
                 import physics
