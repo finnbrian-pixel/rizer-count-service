@@ -8,12 +8,11 @@ via vector fingerprinting or template matching.
 import io
 import logging
 import os
+import resource
 import shutil
 import tempfile
 import traceback
-import uuid
 
-import httpx
 from typing import Any, Dict, Optional
 
 import fitz  # PyMuPDF
@@ -32,6 +31,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def rss_mb() -> float:
+    """Return peak RSS memory usage in MB."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
 app = FastAPI(
     title="Rizer Count Service",
     description="Deterministic sprinkler head counting pipeline for fire protection blueprints.",
@@ -46,47 +51,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-
-async def render_and_upload_page(pdf_path: str, page_no: int = 0) -> str | None:
-    """Render page at 150 DPI, upload to Supabase storage, return public URL."""
-    try:
-        doc = fitz.open(pdf_path)
-        page = doc[page_no]
-
-        # 150 DPI is safe — a 30x42 sheet is ~6250x4375 = 27M pixels, well under cap
-        mat = fitz.Matrix(150 / 72, 150 / 72)
-        pix = page.get_pixmap(matrix=mat)
-        doc.close()
-
-        img_bytes = pix.tobytes("png")
-        del pix  # free 85MB pixmap before upload
-
-        supabase_url = os.environ.get("SUPABASE_URL")
-        service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not service_key:
-            return None
-
-        file_name = f"sheet_previews/{uuid.uuid4()}.png"
-        upload_url = f"{supabase_url}/storage/v1/object/blueprints/{file_name}"
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                upload_url,
-                content=img_bytes,
-                headers={
-                    "Authorization": f"Bearer {service_key}",
-                    "Content-Type": "image/png",
-                },
-            )
-
-        if resp.status_code in (200, 201):
-            return f"{supabase_url}/storage/v1/object/public/blueprints/{file_name}"
-        return None
-    except Exception:
-        return None
 
 
 @app.get("/health")
@@ -147,6 +111,8 @@ async def count_sprinkler_heads(
                 pass
         raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}")
 
+    logger.info(f"RSS after upload: {rss_mb():.0f} MB")
+
     if tmp_pdf_size == 0:
         os.unlink(tmp_pdf_path)
         raise HTTPException(status_code=422, detail="Empty PDF file")
@@ -174,6 +140,7 @@ async def count_sprinkler_heads(
         logger.info(
             f"Triage results: {[(i, r['path'], r['reason']) for i, r in enumerate(page_routes)]}"
         )
+        logger.info(f"RSS after triage: {rss_mb():.0f} MB")
 
         # Collect page dimensions upfront, then close the doc to free memory
         # before count_heads opens its own handle on the same file.
@@ -202,6 +169,7 @@ async def count_sprinkler_heads(
                         f"{sheet_name}: count_heads -> {vector_count_result['total']} heads "
                         f"(confidence={vector_count_result['confidence']:.2f})"
                     )
+                    logger.info(f"RSS after count_heads {sheet_name}: {rss_mb():.0f} MB")
                 except Exception as e:
                     logger.error(f"{sheet_name}: count_heads failed: {e}")
 
@@ -266,16 +234,11 @@ async def count_sprinkler_heads(
             "needs_verification": any_needs_verification,
             "path_used": paths_used[0] if len(set(paths_used)) == 1 else "mixed",
             "sheets": results,
+            # page_image_url is now rendered client-side via pdf.js
+            "page_image_url": None,
         }
 
-        # Render page image for UI overlay (best-effort, never blocks count)
-        page_image_url = None
-        try:
-            page_image_url = await render_and_upload_page(tmp_pdf_path, page_no=0)
-        except Exception:
-            pass
-        response["page_image_url"] = page_image_url
-
+        logger.info(f"RSS before response: {rss_mb():.0f} MB")
         logger.info(
             f"Completed: {pdf.filename} — {total_heads} heads across "
             f"{len(results)} pages, confidence={overall_confidence:.2f}"
