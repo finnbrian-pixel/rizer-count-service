@@ -193,7 +193,7 @@ async def count_sprinkler_heads(
                     "total_heads": vector_count_result["total"],
                     "counts": vector_count_result["counts"],
                     "heads": vector_count_result["heads"],
-                    "rejected": vector_count_result["rejected"],
+                    "rejected": vector_count_result.get("rejected", {}),
                     "confidence": vector_count_result["confidence"],
                     "needs_verification": vector_count_result["needs_verification"],
                     "path_used": route,
