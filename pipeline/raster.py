@@ -1,9 +1,7 @@
 import logging
 from collections import Counter
 
-import cv2
 import fitz
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +42,8 @@ def _apply_pixel_budget(page, dpi: int) -> int:
 
 
 def rasterize(pdf_path: str, page_no: int = 0, dpi: int = DPI):
+    import cv2
+    import numpy as np
     """Rasterize a PDF page to grayscale numpy array at `dpi`.
     
     Returns:
@@ -251,6 +251,7 @@ def crop_template(sheet_gray: np.ndarray, legend_bbox_pts, dpi: int = DPI) -> np
 
 
 def nms(dets: list, iou_thresh: float = 0.30) -> list:
+    import numpy as np
     """
     Non-maximum suppression.
     dets: list of (x, y, w, h, score)
