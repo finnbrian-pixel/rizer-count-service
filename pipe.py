@@ -25,6 +25,7 @@ MIN_SEG_PT = 2.0          # below this, a segment is a symbol stroke not pipe
 HEAD_TOL_PT = 8.0         # endpoint-to-head distance that counts as "connected"
 LABEL_MAX_PT = 30.0       # a size label this far from a run applies to it
 MIN_VOTE_LEN_PT = 20.0    # only real runs vote on the pipe stroke weight
+SYMBOL_GAP_PT = 14.0      # CAD breaks pipe at each head; bridge gaps this size
 WIDTH_TOL = 0.05
 
 SIZE_RE = re.compile(r'^\d+(?:-\d/\d)?"$|^\d/\d"$')
@@ -149,6 +150,50 @@ def _point_to_segment(px, py, s):
     return math.hypot(px - (s["x0"] + t * dx), py - (s["y0"] + t * dy))
 
 
+def bridge_symbol_gaps(segments, axis_tol=1.5, max_gap=SYMBOL_GAP_PT):
+    """Rejoin runs that CAD broke at each sprinkler symbol.
+
+    A branch line is physically continuous, but the drawing interrupts it where
+    each head symbol sits — roughly a foot of gap per head. Counting only the
+    drawn segments understates the installed pipe (7% on ITD FS-01, 133 ft).
+
+    Collinear segments separated by less than a symbol's width are merged; a
+    genuine gap between separate runs is far wider and survives.
+    """
+    verts, horiz, diagonal = defaultdict(list), defaultdict(list), []
+    for s in segments:
+        if abs(s["x0"] - s["x1"]) < axis_tol:
+            key = round((s["x0"] + s["x1"]) / 2 / axis_tol) * axis_tol
+            verts[key].append((min(s["y0"], s["y1"]), max(s["y0"], s["y1"]), s))
+        elif abs(s["y0"] - s["y1"]) < axis_tol:
+            key = round((s["y0"] + s["y1"]) / 2 / axis_tol) * axis_tol
+            horiz[key].append((min(s["x0"], s["x1"]), max(s["x0"], s["x1"]), s))
+        else:
+            diagonal.append(s)
+
+    out = list(diagonal)
+    for group, vertical in ((verts, True), (horiz, False)):
+        for key, items in group.items():
+            items.sort()
+            lo, hi, ref = items[0]
+            for a, b, seg in items[1:]:
+                if a - hi <= max_gap:
+                    hi = max(hi, b)
+                else:
+                    out.append(_run(key, lo, hi, vertical, ref))
+                    lo, hi, ref = a, b, seg
+            out.append(_run(key, lo, hi, vertical, ref))
+    return out
+
+
+def _run(key, lo, hi, vertical, ref):
+    if vertical:
+        return {"x0": key, "y0": lo, "x1": key, "y1": hi,
+                "len": hi - lo, "width": ref["width"]}
+    return {"x0": lo, "y0": key, "x1": hi, "y1": key,
+            "len": hi - lo, "width": ref["width"]}
+
+
 def assign_sizes(pipe, labels, max_dist=LABEL_MAX_PT):
     """Attach the nearest size callout to each pipe segment."""
     for s in pipe:
@@ -207,7 +252,9 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
         doc.close()
         return result
 
-    pipe = [s for s in segments if abs(s["width"] - width) < WIDTH_TOL]
+    raw = [s for s in segments if abs(s["width"] - width) < WIDTH_TOL]
+    drawn_ft = sum(s["len"] for s in raw) * ft_per_pt
+    pipe = bridge_symbol_gaps(raw)
     pipe = assign_sizes(pipe, size_labels(page, x_limit=exclude_right_of))
 
     by_size, unassigned = defaultdict(float), 0.0
@@ -218,7 +265,7 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
             unassigned += s["len"] * ft_per_pt
 
     connected = sum(1 for hx, hy in heads
-                    if any(_endpoint_near_head(s, [(hx, hy)], HEAD_TOL_PT) for s in pipe))
+                    if any(_endpoint_near_head(s, [(hx, hy)], HEAD_TOL_PT) for s in raw))
     coverage = connected / len(heads) if heads else 0.0
     total = sum(by_size.values()) + unassigned
 
@@ -231,6 +278,8 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
                     sorted(by_size.items(), key=lambda kv: -kv[1])},
         "unassigned_ft": round(unassigned, 1),
         "pipe_segments": len(pipe),
+        "drawn_ft": round(drawn_ft, 1),
+        "bridged_ft": round(total - drawn_ft, 1),
         "heads_connected": connected,
         "head_coverage": round(coverage, 3),
         "confidence": round(min(1.0, coverage), 3),
