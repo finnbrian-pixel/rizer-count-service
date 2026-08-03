@@ -1,287 +1,216 @@
 """
-Rizer Count Service — FastAPI microservice for deterministic sprinkler head counting.
+RIZER count service — FastAPI.
 
-AI (Claude) is used ONLY for legend classification. Counting is purely algorithmic
-via vector fingerprinting or template matching.
+Reference implementation. Everything the frontend needs comes back in one
+response, already resolved: which sheet is the plan, the detections for it, and
+the document totals. The frontend should never have to decide which page to
+show or reconcile per-sheet with job totals.
+
+Design rules this file follows, each one from a bug that actually happened:
+
+  * Lazy imports. cv2/numpy at module scope cost ~140 MB resident before a
+    single request. They are imported inside the functions that need them.
+  * Uploads stream to a temp file, never held in memory.
+  * Every page is reported, but `active_sheet` names the plan sheet. A details
+    sheet legitimately returns 0 heads; that is not an error and must not be
+    surfaced as one.
+  * A count of 0 with no plan sheet returns 200 with needs_verification, not a
+    500. "Rejected" is a valid outcome, not a failure.
+  * Pipe is behind `include_pipe`, off by default, until hand-verified.
+  * RSS logged per stage so a memory regression is visible in the logs.
+
+Run:  uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 """
 
-import io
 import logging
 import os
-import resource
 import shutil
 import tempfile
-import traceback
+import time
+import uuid
 
-from typing import Any, Dict, Optional
-
-import fitz  # PyMuPDF
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-from pipeline.assemble import assemble_counts
-from pipeline.triage import triage_pdf
-from hc2 import count_page as count_heads, count_in_region
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("count-service")
 
+ENGINE_VERSION = "hc2-2026.08.03"
+MAX_UPLOAD_MB = 60
 
-def rss_mb() -> float:
-    """Return peak RSS memory usage in MB."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+app = FastAPI(title="RIZER Count Service", version=ENGINE_VERSION)
 
-
-app = FastAPI(
-    title="Rizer Count Service",
-    description="Deterministic sprinkler head counting pipeline for fire protection blueprints.",
-    version="1.0.0",
-)
-
-# CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "https://cfpdesignai.netlify.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def rss_mb():
+    """Resident memory in MB. Logged at each stage so regressions are visible."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024)
+    except Exception:
+        pass
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+    except Exception:
+        return -1
+
+
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "ok", "version": "1.0.0"}
+def health():
+    return {"ok": True, "engine": ENGINE_VERSION, "rss_mb": rss_mb()}
 
 
 @app.post("/count")
-async def count_sprinkler_heads(
-    pdf: UploadFile = File(..., description="PDF blueprint file"),
-    corrections: Optional[str] = Form(
-        None, description="JSON string of prior user corrections"
-    ),
+async def count(
+    file: UploadFile = File(...),
+    include_pipe: bool = Form(False),
 ):
-    """
-    Count sprinkler heads in a PDF blueprint.
+    run_id = str(uuid.uuid4())
+    started = time.time()
+    log.info("run %s: upload begin, rss %s MB", run_id, rss_mb())
 
-    Pipeline:
-    1. Triage pages (vector vs raster)
-    2. Extract/detect symbols via count_heads (vector) or template matching (raster)
-    3. Assemble deterministic counts
-    4. Return overlay data for verification UI
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported by this endpoint")
 
-    Accepts optional `corrections` JSON from prior user verification.
-    """
-    # Validate file
-    if not pdf.filename or not pdf.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=422,
-            detail="File must be a PDF. Received: " + (pdf.filename or "no filename"),
-        )
-
-    # Parse corrections if provided
-    corrections_dict: Optional[Dict[str, Any]] = None
-    if corrections:
-        try:
-            import json
-            corrections_dict = json.loads(corrections)
-        except (json.JSONDecodeError, TypeError) as e:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid corrections JSON: {e}",
-            )
-
-    # Stream upload directly to temp file — never buffer full bytes in memory
-    tmp_pdf_path = None
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-            shutil.copyfileobj(pdf.file, tmp_pdf)
-            tmp_pdf_path = tmp_pdf.name
-            tmp_pdf_size = tmp_pdf.tell()
-    except Exception as e:
-        if tmp_pdf_path:
-            try:
-                os.unlink(tmp_pdf_path)
-            except Exception:
-                pass
-        raise HTTPException(status_code=422, detail=f"Failed to read PDF: {e}")
+        size = 0
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_MB * 1024 * 1024:
+                raise HTTPException(413, f"PDF exceeds {MAX_UPLOAD_MB} MB")
+            tmp.write(chunk)
+        tmp.close()
+        log.info("run %s: upload done, %.1f MB file, rss %s MB",
+                 run_id, size / 1e6, rss_mb())
 
-    logger.info(f"RSS after upload: {rss_mb():.0f} MB")
-
-    if tmp_pdf_size == 0:
-        os.unlink(tmp_pdf_path)
-        raise HTTPException(status_code=422, detail="Empty PDF file")
-
-    # Open PDF with PyMuPDF from disk path — no in-memory stream copy
-    try:
-        doc = fitz.open(tmp_pdf_path)
-    except Exception as e:
-        os.unlink(tmp_pdf_path)
-        raise HTTPException(
-            status_code=422,
-            detail=f"Corrupt or invalid PDF: {e}",
-        )
-
-    if len(doc) == 0:
-        doc.close()
-        os.unlink(tmp_pdf_path)
-        raise HTTPException(status_code=422, detail="PDF has no pages")
-
-    try:
-        # Stage 0 — Triage
-        logger.info(f"Processing PDF: {pdf.filename}, {len(doc)} pages")
-
-        page_routes = triage_pdf(tmp_pdf_path)
-        logger.info(
-            f"Triage results: {[(i, r['path'], r['reason']) for i, r in enumerate(page_routes)]}"
-        )
-        logger.info(f"RSS after triage: {rss_mb():.0f} MB")
-
-        # Collect page dimensions upfront, then close the doc to free memory
-        # before count_heads opens its own handle on the same file.
-        page_dims = [(doc[i].rect.width, doc[i].rect.height) for i in range(len(doc))]
-        doc.close()
-
-        results: list = []
-
-        for page_idx, triage_result in enumerate(page_routes):
-            route = triage_result["path"]
-            page_width, page_height = page_dims[page_idx]
-            sheet_name = f"SHEET-{page_idx + 1}"
-
-            logger.info(
-                f"Processing {sheet_name} via '{route}' path "
-                f"(page={page_width:.0f}x{page_height:.0f} pt)"
-            )
-
-            vector_count_result = None
-
-            # Stage 1A — Vector Counting
-            if route in ("vector", "hybrid"):
-                try:
-                    vector_count_result = count_heads(tmp_pdf_path, page_no=page_idx)
-                    logger.info(
-                        f"{sheet_name}: count_heads -> {vector_count_result['total']} heads "
-                        f"(confidence={vector_count_result['confidence']:.2f})"
-                    )
-                    logger.info(f"RSS after count_heads {sheet_name}: {rss_mb():.0f} MB")
-                except Exception as e:
-                    logger.error(f"{sheet_name}: count_heads failed: {e}")
-
-            # Stage 1B — Raster path
-            if route in ("raster", "hybrid") and vector_count_result is None:
-                # Pure raster path: no vector result available.
-                # Template matching without cluster samples is not supported;
-                # fall through to assemble_counts with no positions so the
-                # caller receives needs_verification=True and can prompt the user.
-                logger.warning(
-                    f"{sheet_name}: Raster path active but no vector result available. "
-                    "Skipping template matching — needs_verification will be set."
-                )
-
-            # Stage 2 — Build page result
-            if vector_count_result is not None:
-                # Build the page result directly from count_heads output.
-                # This covers vector and hybrid routes.
-                page_result = {
-                    "sheet_name": sheet_name,
-                    "total_heads": vector_count_result["total"],
-                    "counts": vector_count_result["counts"],
-                    "heads": vector_count_result["heads"],
-                    "rejected": vector_count_result.get("rejected", {}),
-                    "confidence": vector_count_result["confidence"],
-                    "needs_verification": vector_count_result["needs_verification"],
-                    "path_used": route,
-                    "method": vector_count_result.get("method", "vector-geometric"),
-                }
-            else:
-                # Raster-only fallback: assemble with no positions
-                page_result = assemble_counts(
-                    vector_positions=None,
-                    raster_positions=None,
-                    classification=None,
-                    page_width=page_width,
-                    page_height=page_height,
-                    sheet_name=sheet_name,
-                    path_used=route,
-                    corrections=corrections_dict,
-                )
-
-            results.append(page_result)
-
-        # Aggregate results
-        total_heads = sum(r["total_heads"] for r in results)
-        overall_confidence = (
-            min(r["confidence"] for r in results) if results else 0.0
-        )
-        any_needs_verification = any(
-            r.get("needs_verification", False) for r in results
-        )
-
-        # Collect routing info for caller visibility
-        paths_used = [r.get("path_used", "unknown") for r in results]
-
-        response = {
-            "filename": pdf.filename,
-            "pages_processed": len(results),
-            "total_heads": total_heads,
-            "confidence": overall_confidence,
-            "needs_verification": any_needs_verification,
-            "path_used": paths_used[0] if len(set(paths_used)) == 1 else "mixed",
-            "sheets": results,
-            # page_image_url is now rendered client-side via pdf.js
-            "page_image_url": None,
-        }
-
-        logger.info(f"RSS before response: {rss_mb():.0f} MB")
-        logger.info(
-            f"Completed: {pdf.filename} — {total_heads} heads across "
-            f"{len(results)} pages, confidence={overall_confidence:.2f}"
-        )
-
-        return JSONResponse(content=response)
-
-    except HTTPException:
-        raise
-    except MemoryError:
-        logger.error("OOM: PDF raster resolution exceeds memory limits")
-        return JSONResponse(
-            status_code=422,
-            content={
-                "error": "File too large to process",
-                "reason": "PDF raster resolution exceeds memory limits even after downscaling",
-                "needs_verification": True,
-            },
-        )
-    except Exception as e:
-        logger.exception("Pipeline failed")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "Processing failed",
-                "reason": str(e),
-                "needs_verification": True,
-            },
-        )
+        payload = _process(tmp.name, file.filename, include_pipe, run_id)
+        payload["runtime_ms"] = int((time.time() - started) * 1000)
+        payload["peak_mb"] = rss_mb()
+        log.info("run %s: done in %s ms, rss %s MB, total %s heads on sheet %s",
+                 run_id, payload["runtime_ms"], payload["peak_mb"],
+                 payload["document"]["total_heads"], payload["active_sheet"])
+        return payload
     finally:
-        # doc already closed above after collecting page dims;
-        # guard in case of early exception before that point.
         try:
-            doc.close()
-        except Exception:
-            pass
-        # Clean up temp file
-        try:
-            os.unlink(tmp_pdf_path)
+            os.unlink(tmp.name)
         except Exception:
             pass
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def _process(path, original_name, include_pipe, run_id):
+    import hc2                      # lazy: keeps baseline RSS low
+
+    doc = hc2.count_document(path)
+    log.info("run %s: %s sheets, plan sheets %s, rss %s MB",
+             run_id, doc["sheets"], doc["plan_sheets"], rss_mb())
+
+    sheets = []
+    for page in doc["pages"]:
+        sheets.append({
+            "page": page["page"],
+            "sheet_kind": page["sheet_kind"],
+            "is_plan": page["sheet_kind"] == "plan",
+            "total": page["total"],
+            "counts": page["counts"],
+            "learned_types": page["learned_types"],
+            "confidence": page["confidence"],
+            "needs_verification": page["needs_verification"],
+            "physics": page.get("physics"),
+            "reason": page.get("reason"),
+        })
+
+    # The single most important line in this file: pick the plan sheet.
+    # A details sheet correctly returns 0 and must not be shown as the result.
+    active = doc["plan_sheets"][0] if doc["plan_sheets"] else None
+
+    detections = []
+    if active is not None:
+        page = doc["pages"][active]
+        detections = [
+            {
+                "id": f"{run_id}:{active}:{i}",
+                "cx": h["x"],
+                "cy": h["y"],
+                "classification": h["type"],
+                "confidence": page["confidence"],
+                "signature_hash": h.get("signature_hash"),
+            }
+            for i, h in enumerate(page["heads"])
+        ]
+
+    geom = _page_geometry(path, active)
+
+    payload = {
+        "run_id": run_id,
+        "engine_version": ENGINE_VERSION,
+        "filename": original_name,
+        "active_sheet": active,
+        "sheets": sheets,
+        "detections": detections,
+        "document": {
+            "total_heads": doc["document_total"],
+            "counts": doc["document_counts"],
+            "sheet_count": doc["sheets"],
+            "plan_sheets": doc["plan_sheets"],
+            "needs_verification": doc["needs_verification"],
+        },
+        "page": geom,
+        "pipe": None,
+    }
+
+    if active is None:
+        payload["notice"] = (
+            "No sheet in this set contains a sprinkler head layout. Design-intent "
+            "and permit sets often show hazard areas only; the contractor lays out "
+            "the heads. Nothing to count."
+        )
+
+    if include_pipe and active is not None:
+        payload["pipe"] = _pipe(path, active, run_id)
+
+    return payload
+
+
+def _page_geometry(path, active):
+    """Page size in PDF points — the coordinate space detections are reported in."""
+    if active is None:
+        return None
+    import fitz
+    doc = fitz.open(path)
+    try:
+        page = doc[active]
+        return {"page_no": active,
+                "width": page.rect.width,
+                "height": page.rect.height}
+    finally:
+        doc.close()
+
+
+def _pipe(path, active, run_id):
+    try:
+        import pipe as pipe_mod
+        result = pipe_mod.pipe_takeoff(path, active)
+        log.info("run %s: pipe %.0f ft, coverage %s, rss %s MB",
+                 run_id, result["total_ft"], result.get("head_coverage"), rss_mb())
+        return result
+    except Exception as exc:                      # never fail the count over pipe
+        log.exception("run %s: pipe takeoff failed", run_id)
+        return {"error": str(exc), "needs_verification": True}

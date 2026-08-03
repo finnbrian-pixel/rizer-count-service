@@ -53,11 +53,6 @@ def _qa(a):
     return round(a / ANGLE_QUANT_DEG) * ANGLE_QUANT_DEG % 180
 
 
-def _sig_hash(sig_tuple):
-    """Stable 8-char hex hash of a cluster signature tuple."""
-    return hashlib.sha256(str(sig_tuple).encode()).hexdigest()[:8]
-
-
 def element_of(d):
     """Build an element from a get_cdrawings() record (plain tuples, no
     Point/Rect objects -- roughly half the memory of get_drawings())."""
@@ -155,6 +150,16 @@ def collapse(elems, tol=COINCIDENT_TOL_PT):
                    and abs(e["cy"] - o["cy"]) < tol for o in out):
             out.append(e)
     return out
+
+
+def _sig_hash(sig):
+    """Stable short fingerprint of a symbol signature.
+
+    This is what makes per-customer symbol learning possible: a correction
+    recorded against this hash teaches the org's symbol table, so the same
+    engineer's next drawing is recognised without asking again.
+    """
+    return hashlib.sha1(repr(sig).encode()).hexdigest()[:12]
 
 
 def cluster_signature(seed, index, cell, noise_floor=0.0):
@@ -303,13 +308,8 @@ def learn_symbols(page, table, rows, elements):
     For each head row, take the drawn elements in the symbol column and
     register a signature for every element treated as core. Registering all
     of them removes the legend-vs-plan 'which element is the core' mismatch.
-
-    Returns (learned, base_sigs) where learned maps every variant signature
-    to its label and base_sigs is the set of signatures that matched without
-    any rotation/mirror (the canonical legend orientation).
     """
     learned = {}
-    base_sigs = set()
     for row in rows:
         if not is_head_row(row["description"]):
             continue
@@ -321,12 +321,11 @@ def learn_symbols(page, table, rows, elements):
         idx, cell = build_index(parts)
         label = short_label(row["description"])
         sig = tuple(sorted(descriptor(p) for p in collapse(parts)))
-        base_sigs.add(sig)
         for variant in orientation_variants(sig):
             learned.setdefault(variant, label)
         row["measured"] = [(p["kinds"], round(p["raw_w"], 1), round(p["raw_h"], 1),
                             p["filled"], p["angles"]) for p in parts]
-    return learned, base_sigs
+    return learned
 
 
 def _rot_desc(d, k, mirror):
@@ -400,20 +399,15 @@ def dedupe_coincident(items, tol=COINCIDENT_TOL_PT):
     return out
 
 
-def count_page(pdf_path, page_no=0, extra_symbols=None, extra_base_sigs=None):
+def count_page(pdf_path, page_no=0, extra_symbols=None):
     doc = fitz.open(pdf_path)
     page = doc[page_no]
     elements = small_elements(page)
     anchor, table, rows = find_legend(page)
-    if table:
-        learned, base_sigs = learn_symbols(page, table, rows, elements)
-    else:
-        learned, base_sigs = {}, set()
+    learned = learn_symbols(page, table, rows, elements) if table else {}
     if extra_symbols:
         for sig, label in extra_symbols.items():
             learned.setdefault(sig, label)
-    if extra_base_sigs:
-        base_sigs.update(extra_base_sigs)
 
     # Exclude the legend TABLE RECTANGLE, not a half-plane: legends appear on
     # the left as often as the right, and a half-plane rule wipes the sheet.
@@ -455,13 +449,11 @@ def count_page(pdf_path, page_no=0, extra_symbols=None, extra_base_sigs=None):
             continue
         sig, cx, cy = cluster_signature(e, idx, cell, noise_floor)
         if sig in learned:
-            # Per-detection confidence: base signature = 0.95, orientation variant = 0.85
-            conf = 0.95 if sig in base_sigs else 0.85
-            found.append({"cx": cx, "cy": cy, "type": learned[sig], "sig_hash": _sig_hash(sig), "confidence": conf})
+            found.append({"cx": cx, "cy": cy, "type": learned[sig],
+                          "sig_hash": _sig_hash(sig)})
 
-    heads = [{"x": round(f["cx"], 1), "y": round(f["cy"], 1),
-             "type": f["type"], "signature_hash": f["sig_hash"],
-             "confidence": f.get("confidence", 0.95)}
+    heads = [{"x": round(f["cx"], 1), "y": round(f["cy"], 1), "type": f["type"],
+              "signature_hash": f["sig_hash"]}
              for f in dedupe_coincident(found, tol=CONCENTRIC_TOL_PT)]
 
     result.update({
@@ -499,33 +491,32 @@ def learn_document_symbols(pdf_path):
     plan sheets return zero -- they have nothing to learn from.
     """
     doc = fitz.open(pdf_path)
-    pooled, pooled_base_sigs, sources = {}, set(), []
+    pooled, sources = {}, []
     for i in range(len(doc)):
         page = doc[i]
         elements = small_elements(page)
         anchor, table, rows = find_legend(page)
         if not table:
             continue
-        learned, base_sigs = learn_symbols(page, table, rows, elements)
+        learned = learn_symbols(page, table, rows, elements)
         if learned:
             for sig, label in learned.items():
                 pooled.setdefault(sig, label)
-            pooled_base_sigs.update(base_sigs)
             sources.append({"page": i, "types": sorted(set(learned.values()))})
     doc.close()
-    return pooled, pooled_base_sigs, sources
+    return pooled, sources
 
 
 def count_document(pdf_path, validate=True):
     """Two-pass: learn symbols across the whole set, then count each sheet."""
-    pooled, pooled_base_sigs, sources = learn_document_symbols(pdf_path)
+    pooled, sources = learn_document_symbols(pdf_path)
     doc = fitz.open(pdf_path)
     n = len(doc)
     doc.close()
 
     pages = []
     for i in range(n):
-        p = count_page(pdf_path, i, extra_symbols=pooled, extra_base_sigs=pooled_base_sigs)
+        p = count_page(pdf_path, i, extra_symbols=pooled)
         if validate and p["total"]:
             try:
                 import physics

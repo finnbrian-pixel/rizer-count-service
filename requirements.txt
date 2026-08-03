@@ -1,8 +1,4 @@
 fastapi
 uvicorn[standard]
-PyMuPDF
-opencv-python-headless
-numpy
-anthropic
 python-multipart
-pillow
+PyMuPDF
