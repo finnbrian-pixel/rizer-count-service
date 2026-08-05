@@ -52,6 +52,7 @@ Two passes, cleanly separated:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -103,6 +104,8 @@ class Severity(str, Enum):
     COORDINATE = "coordinate"
     RFI = "rfi"
 
+
+_log = logging.getLogger("scope_breakdown")
 
 LLM_MODEL = "claude-sonnet-5"
 
@@ -183,6 +186,7 @@ class Coverage:
     titleblock_pages_parsed: int = 0
     llm_calls_made: int = 0
     llm_calls_failed: int = 0
+    llm_last_error: str | None = None
 
 
 @dataclass
@@ -496,7 +500,7 @@ EXTRACTION_TOOL = {
                         "title": {"type": "string"},
                         "detail": {"type": "string"},
                         "severity": {"type": "string", "enum": ["info", "coordinate", "rfi"]},
-                        "suggested_rfi": {"type": ["string", "null"], "description": "Only if severity is rfi"},
+                        "suggested_rfi": {"type": "string", "description": "Only if severity is rfi; omit otherwise"},
                     },
                     "required": ["title", "detail", "severity"],
                 },
@@ -554,8 +558,14 @@ def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Co
             if block.type == "tool_use" and block.name == "record_findings":
                 return block.input
         return {}
-    except Exception:
+    except Exception as exc:
+        # Silent failure here cost a full debugging cycle once: every call
+        # 400'd and the report simply showed empty lists. Log loudly and keep
+        # the first error on the coverage object so it surfaces in the report.
         coverage.llm_calls_failed += 1
+        if coverage.llm_last_error is None:
+            coverage.llm_last_error = f"{type(exc).__name__}: {exc}"[:400]
+        _log.warning("llm_extract failed (%s p.%s): %s", doc_label, page, exc)
         return {}
 
 
