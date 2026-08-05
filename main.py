@@ -232,16 +232,25 @@ MAX_SCOPE_FILES = 6
 
 @app.post("/scope")
 async def scope(
-    files: list[UploadFile] = File(...),
+    file: UploadFile = File(..., description="Primary PDF (drawings or specs)"),
+    file2: UploadFile | None = File(None, description="Optional: specs / project manual"),
+    file3: UploadFile | None = File(None, description="Optional: addendum"),
+    file4: UploadFile | None = File(None, description="Optional: additional volume"),
     company: str = Form("Unknown Contractor"),
 ):
+    """Division 21 scope extraction from a bid package.
+
+    Separate file fields rather than one repeating field: Swagger UI renders
+    a real file picker for a single UploadFile but degrades a list[UploadFile]
+    into a plain text box, which makes the interactive docs unusable for
+    testing. Four slots covers drawings + specs + addendum + one spare, which
+    is the shape of essentially every package.
+    """
+    files = [f for f in (file, file2, file3, file4) if f is not None and f.filename]
     run_id = str(uuid.uuid4())
     started = time.time()
     log.info("scope %s: upload begin, %s file(s), rss %s MB",
              run_id, len(files), rss_mb())
-
-    if len(files) > MAX_SCOPE_FILES:
-        raise HTTPException(400, f"Send at most {MAX_SCOPE_FILES} PDFs per request")
 
     tmp_paths = []
     try:
