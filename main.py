@@ -214,3 +214,75 @@ def _pipe(path, active, run_id):
     except Exception as exc:                      # never fail the count over pipe
         log.exception("run %s: pipe takeoff failed", run_id)
         return {"error": str(exc), "needs_verification": True}
+
+
+# ---------------------------------------------------------------------------
+# Scope breakdown — Division 21 scope extraction from a bid package.
+#
+# Separate concern from /count: this endpoint does not look at geometry or
+# count anything. It reads the package's words and answers "what is in my
+# scope, and where does the package say so?"
+#
+# Accepts 1..N PDFs in one request (drawings + specs + addenda are usually
+# separate files and the analysis is materially better with all of them).
+# ---------------------------------------------------------------------------
+
+MAX_SCOPE_FILES = 6
+
+
+@app.post("/scope")
+async def scope(
+    files: list[UploadFile] = File(...),
+    company: str = Form("Unknown Contractor"),
+):
+    run_id = str(uuid.uuid4())
+    started = time.time()
+    log.info("scope %s: upload begin, %s file(s), rss %s MB",
+             run_id, len(files), rss_mb())
+
+    if len(files) > MAX_SCOPE_FILES:
+        raise HTTPException(400, f"Send at most {MAX_SCOPE_FILES} PDFs per request")
+
+    tmp_paths = []
+    try:
+        package = {}
+        for f in files:
+            if not f.filename.lower().endswith(".pdf"):
+                raise HTTPException(400, f"{f.filename}: only PDF files are supported")
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp_paths.append(tmp.name)
+            size = 0
+            while chunk := await f.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(413, f"{f.filename} exceeds {MAX_UPLOAD_MB} MB")
+                tmp.write(chunk)
+            tmp.close()
+            package[f.filename] = tmp.name
+            log.info("scope %s: %s staged, %.1f MB", run_id, f.filename, size / 1e6)
+
+        payload = _scope_analyze(package, company, run_id)
+        payload["run_id"] = run_id
+        payload["runtime_ms"] = int((time.time() - started) * 1000)
+        payload["peak_mb"] = rss_mb()
+        log.info("scope %s: done in %s ms, rss %s MB, llm=%s, %s sheets, "
+                 "%s scope items, %s criteria",
+                 run_id, payload["runtime_ms"], payload["peak_mb"],
+                 payload["llm_available"], len(payload["sheets"]),
+                 len(payload["scope_items"]), len(payload["design_criteria"]))
+        return payload
+    finally:
+        for p in tmp_paths:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+
+def _scope_analyze(package, company, run_id):
+    import dataclasses
+    import scope_breakdown                 # lazy: keeps baseline RSS low
+
+    profile = scope_breakdown.ContractorProfile(company=company)
+    report = scope_breakdown.analyze(package, profile)
+    return dataclasses.asdict(report)
