@@ -29,6 +29,7 @@ import tempfile
 import time
 import uuid
 
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -270,7 +271,23 @@ async def scope(
             package[f.filename] = tmp.name
             log.info("scope %s: %s staged, %.1f MB", run_id, f.filename, size / 1e6)
 
-        payload = _scope_analyze(package, company, run_id)
+        try:
+            payload = _scope_analyze(package, company, run_id)
+        except Exception as exc:
+            # A bare 500 tells the caller nothing and cost a debugging cycle.
+            # Always return a readable, structured body naming what broke.
+            log.exception("scope %s: analyze failed", run_id)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                    "stage": "analyze",
+                    "run_id": run_id,
+                    "files": list(package.keys()),
+                    "runtime_ms": int((time.time() - started) * 1000),
+                    "peak_mb": rss_mb(),
+                },
+            )
         payload["run_id"] = run_id
         payload["runtime_ms"] = int((time.time() - started) * 1000)
         payload["peak_mb"] = rss_mb()

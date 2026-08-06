@@ -55,6 +55,8 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -106,6 +108,11 @@ class Severity(str, Enum):
 
 
 _log = logging.getLogger("scope_breakdown")
+
+# Cap on concurrent LLM calls. Low on purpose: the aim is to stop
+# serializing network waits, not to maximize throughput in a 512 MB box.
+LLM_CONCURRENCY = 4
+_coverage_lock = threading.Lock()
 
 LLM_MODEL = "claude-sonnet-5"
 
@@ -565,7 +572,8 @@ def _get_client():
 def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Coverage) -> dict:
     """One semantic extraction call over a candidate block. Returns dict of
     lists matching the tool schema, or empty dict on failure (never raises)."""
-    coverage.llm_calls_made += 1
+    with _coverage_lock:
+        coverage.llm_calls_made += 1
     try:
         resp = client.messages.create(
             model=LLM_MODEL,
@@ -583,9 +591,10 @@ def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Co
         # Silent failure here cost a full debugging cycle once: every call
         # 400'd and the report simply showed empty lists. Log loudly and keep
         # the first error on the coverage object so it surfaces in the report.
-        coverage.llm_calls_failed += 1
-        if coverage.llm_last_error is None:
-            coverage.llm_last_error = f"{type(exc).__name__}: {exc}"[:400]
+        with _coverage_lock:
+            coverage.llm_calls_failed += 1
+            if coverage.llm_last_error is None:
+                coverage.llm_last_error = f"{type(exc).__name__}: {exc}"[:400]
         _log.warning("llm_extract failed (%s p.%s): %s", doc_label, page, exc)
         return {}
 
@@ -613,11 +622,36 @@ def _verify_quote(quote: str, source: str) -> str | None:
     looks like evidence. So every quote is checked against the extracted page
     text before it is allowed to be called verbatim.
     """
-    if not quote or len(quote) < 12:
+    quote = _s(quote)
+    if len(quote) < 12:
         return None
     if _normalize_for_match(quote) in _normalize_for_match(source):
         return quote.strip()
     return None
+
+
+def _s(v) -> str:
+    """Coerce any model-supplied value to a string.
+
+    The schema asks for strings, but a model can return null, a number, or a
+    nested object for any field. Slicing or storing those raised an unhandled
+    TypeError that turned one malformed item into a 500 for the entire request.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+
+def _iter_dicts(raw: dict, key: str):
+    """Yield only the dict-shaped entries under `key`, tolerating a non-list."""
+    seq = raw.get(key) or []
+    if not isinstance(seq, list):
+        return
+    for entry in seq:
+        if isinstance(entry, dict):
+            yield entry
 
 
 def _to_dataclasses(raw: dict, doc_label: str, page: int, excerpt_src: str,
@@ -631,43 +665,49 @@ def _to_dataclasses(raw: dict, doc_label: str, page: int, excerpt_src: str,
         verified = _verify_quote(obj.get("quote", ""), excerpt_src)
         if verified:
             if coverage is not None:
-                coverage.quotes_verified += 1
+                with _coverage_lock:
+                    coverage.quotes_verified += 1
             return Evidence(doc_label, page, verified[:300], verbatim=True)
         if coverage is not None:
-            coverage.quotes_unverified += 1
-        return Evidence(doc_label, page, obj.get(fallback_key, excerpt_src)[:300],
-                        verbatim=False)
+            with _coverage_lock:
+                coverage.quotes_unverified += 1
+        fallback = _s(obj.get(fallback_key)) or _s(excerpt_src)
+        return Evidence(doc_label, page, fallback[:300], verbatim=False)
 
-    for si in raw.get("scope_items", []):
+    for si in _iter_dicts(raw, "scope_items"):
         items.append(ScopeItem(
-            label=si.get("label", "")[:80],
-            detail=si.get("detail", ""),
+            label=_s(si.get("label"))[:80],
+            detail=_s(si.get("detail")),
             confidence=Confidence.MEDIUM,
             evidence=ev(si, "detail"),
             cost_flag=bool(si.get("cost_flag", False)),
         ))
-    for dc in raw.get("design_criteria", []):
+    for dc in _iter_dicts(raw, "design_criteria"):
         criteria.append(DesignCriterion(
-            category=dc.get("category", "General"),
-            requirement=dc.get("requirement", ""),
+            category=_s(dc.get("category")) or "General",
+            requirement=_s(dc.get("requirement")),
             evidence=ev(dc, "requirement"),
         ))
-    for iface in raw.get("interfaces", []):
+    for iface in _iter_dicts(raw, "interfaces"):
+        direction = _s(iface.get("direction")) or "coordinate"
+        if direction not in ("they_provide", "we_provide", "coordinate"):
+            direction = "coordinate"
         interfaces.append(Interface(
-            counterparty=iface.get("counterparty", "Unknown"),
-            description=iface.get("description", ""),
-            direction=iface.get("direction", "coordinate"),
+            counterparty=_s(iface.get("counterparty")) or "Unknown",
+            description=_s(iface.get("description")),
+            direction=direction,
             evidence=ev(iface, "description"),
         ))
-    for fl in raw.get("flags", []):
-        sev_raw = fl.get("severity", "info")
+    for fl in _iter_dicts(raw, "flags"):
+        sev_raw = _s(fl.get("severity"))
         sev = Severity(sev_raw) if sev_raw in ("info", "coordinate", "rfi") else Severity.INFO
+        rfi = fl.get("suggested_rfi")
         flags.append(Flag(
-            title=fl.get("title", "")[:100],
-            detail=fl.get("detail", ""),
+            title=_s(fl.get("title"))[:100],
+            detail=_s(fl.get("detail")),
             severity=sev,
             evidence=ev(fl, "detail"),
-            suggested_rfi=fl.get("suggested_rfi"),
+            suggested_rfi=_s(rfi) if rfi else None,
         ))
     return items, criteria, interfaces, flags
 
@@ -718,6 +758,25 @@ def extract_project_name(docs: list["Document"]) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _extract_one(client, doc_label: str, page: int, block: str, coverage: "Coverage"):
+    """Extract one block. Returns parsed tuples, or None if anything went wrong.
+
+    Every exception is contained here. A single bad block — a network blip, a
+    malformed tool result, an unexpected field type — must degrade that one
+    block's contribution to nothing, never fail the whole request.
+    """
+    try:
+        raw = llm_extract(client, block, doc_label, page, coverage)
+        return _to_dataclasses(raw, doc_label, page, block, coverage)
+    except Exception as exc:
+        with _coverage_lock:
+            coverage.llm_calls_failed += 1
+            if coverage.llm_last_error is None:
+                coverage.llm_last_error = f"{type(exc).__name__}: {exc}"[:400]
+        _log.warning("block extraction failed (%s p.%s): %s", doc_label, page, exc)
+        return None
+
+
 def analyze(package: dict[str, str], profile: ContractorProfile) -> ScopeReport:
     docs = [Document.load(p, label=Path(p).name) for p in package.values()]
     coverage = Coverage()
@@ -762,14 +821,31 @@ def analyze(package: dict[str, str], profile: ContractorProfile) -> ScopeReport:
     all_flags: list[Flag] = []
 
     if llm_available:
-        for doc, page, header, block in scope_blocks:
-            raw = llm_extract(client, block, doc.label, page, coverage)
-            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block, coverage)
-            all_items += i; all_criteria += c; all_interfaces += iface; all_flags += fl
+        # One work item per candidate block, from both sources.
+        jobs = [(d.label, pg, blk) for d, pg, _hdr, blk in scope_blocks]
+        jobs += [(d.label, pg, blk) for d, pg, blk in div21_blocks]
 
-        for doc, page, block in div21_blocks:
-            raw = llm_extract(client, block, doc.label, page, coverage)
-            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block, coverage)
+        # Run them concurrently. Sequentially this took ~15s per block, so a
+        # seven-section package spent two minutes waiting on network round
+        # trips that don't depend on each other. Concurrency is capped low:
+        # the goal is to stop serializing, not to maximize throughput, and a
+        # 512 MB container should not hold many responses in flight at once.
+        results = [None] * len(jobs)
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(LLM_CONCURRENCY, len(jobs))) as pool:
+                futures = {
+                    pool.submit(_extract_one, client, label, page, block, coverage): idx
+                    for idx, (label, page, block) in enumerate(jobs)
+                }
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+
+        # Merge in original document order so output is stable across runs
+        # even though completion order is not.
+        for res in results:
+            if not res:
+                continue
+            i, c, iface, fl = res
             all_items += i; all_criteria += c; all_interfaces += iface; all_flags += fl
     else:
         all_flags.append(Flag(
