@@ -116,10 +116,11 @@ _coverage_lock = threading.Lock()
 
 LLM_MODEL = "claude-sonnet-5"
 
-# Generous on purpose. Each finding now carries a verbatim quote, which
-# roughly doubled output size; at 2000 the model exhausted its budget
-# partway through the schema and the tail (flags) came back empty.
-MAX_OUTPUT_TOKENS = 8000
+# 2000 is the value from the last run verified end to end: 37 seconds, 92
+# findings, zero failures. 8000 was tried and made generation long enough to
+# outlast a browser. The missing flags were caused by field ORDER, not by
+# headroom, so that is the only thing changed from the known-good run.
+MAX_OUTPUT_TOKENS = 2000
 
 
 # ---------------------------------------------------------------------------
