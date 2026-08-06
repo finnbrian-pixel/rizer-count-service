@@ -496,9 +496,9 @@ EXTRACTION_TOOL = {
                         "counterparty": {"type": "string", "description": "e.g. Electrical, Plumbing, Elevator, Fire Alarm"},
                         "description": {"type": "string"},
                         "direction": {"type": "string", "enum": ["they_provide", "we_provide", "coordinate"]},
-                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text. Copy, do not paraphrase. 10-40 words."},
+                        "quote": {"type": "string", "description": "VERBATIM span from the source text if one supports this interface. OPTIONAL — omit it if the interface is implied rather than stated in a single sentence. Never paraphrase into this field."},
                     },
-                    "required": ["counterparty", "description", "direction", "quote"],
+                    "required": ["counterparty", "description", "direction"],
                 },
             },
             "flags": {
@@ -510,9 +510,9 @@ EXTRACTION_TOOL = {
                         "detail": {"type": "string"},
                         "severity": {"type": "string", "enum": ["info", "coordinate", "rfi"]},
                         "suggested_rfi": {"type": "string", "description": "Only if severity is rfi; omit otherwise"},
-                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text that triggered this flag. Copy, do not paraphrase. 10-40 words."},
+                        "quote": {"type": "string", "description": "VERBATIM span that triggered this flag, if one exists. OPTIONAL — many flags concern what the document FAILS to say, which has no sentence to quote. Omit rather than paraphrase."},
                     },
-                    "required": ["title", "detail", "severity", "quote"],
+                    "required": ["title", "detail", "severity"],
                 },
             },
         },
@@ -536,6 +536,13 @@ Rules:
   characters out of the block, including its original punctuation and any
   typos. Every quote is checked against the source text and silently
   discarded if it does not match, so a paraphrase there loses the citation.
+- For scope_items and design_criteria a quote is REQUIRED — these are claims
+  about what the spec says, and must be citable.
+- For flags and interfaces a quote is OPTIONAL. Many of the most valuable
+  flags concern what the document FAILS to say (a missing size, an unstated
+  code edition, an undefined extent) and no sentence states an omission.
+  NEVER suppress a flag or interface because you cannot find a quote for it —
+  report it and omit the quote field.
 - cost_flag = true only for items that carry real, commonly-missed cost
   (firestopping, patching, permits, escutcheons, access panels, training,
   spare stock, cleanup) — not routine installation work.
