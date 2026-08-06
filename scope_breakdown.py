@@ -116,6 +116,11 @@ _coverage_lock = threading.Lock()
 
 LLM_MODEL = "claude-sonnet-5"
 
+# Generous on purpose. Each finding now carries a verbatim quote, which
+# roughly doubled output size; at 2000 the model exhausted its budget
+# partway through the schema and the tail (flags) came back empty.
+MAX_OUTPUT_TOKENS = 8000
+
 
 # ---------------------------------------------------------------------------
 # Evidence + findings  (unchanged shape — anything downstream that already
@@ -200,6 +205,7 @@ class Coverage:
     llm_last_error: str | None = None
     quotes_verified: int = 0
     quotes_unverified: int = 0
+    truncated_responses: int = 0
 
 
 @dataclass
@@ -527,6 +533,18 @@ EXTRACTION_TOOL = {
     },
 }
 
+# Emission order matters. The model fills the schema in key order, so the
+# categories listed first are the ones guaranteed to be produced. Flags and
+# interfaces are the scarce, high-value findings; scope items are abundant and
+# repetitive. Put the scarce ones first so any future truncation costs a
+# routine scope line rather than the RFI that was worth money.
+_FIELD_PRIORITY = ["flags", "interfaces", "design_criteria", "scope_items"]
+assert set(_FIELD_PRIORITY) == set(EXTRACTION_TOOL["input_schema"]["properties"])
+EXTRACTION_TOOL["input_schema"]["properties"] = {
+    k: EXTRACTION_TOOL["input_schema"]["properties"][k] for k in _FIELD_PRIORITY
+}
+
+
 SYSTEM_PROMPT = """You are a fire sprinkler estimator's assistant reading a construction bid
 package. You are given one text block (a scope-of-work section or a Division 21
 specification section). Extract ONLY what pertains to the fire sprinkler /
@@ -577,7 +595,7 @@ def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Co
     try:
         resp = client.messages.create(
             model=LLM_MODEL,
-            max_tokens=2000,
+            max_tokens=MAX_OUTPUT_TOKENS,
             system=SYSTEM_PROMPT,
             tools=[EXTRACTION_TOOL],
             tool_choice={"type": "tool", "name": "record_findings"},
@@ -585,6 +603,13 @@ def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Co
         )
         for block in resp.content:
             if block.type == "tool_use" and block.name == "record_findings":
+                if getattr(resp, "stop_reason", None) == "max_tokens":
+                    # Output was cut off mid-schema, so whatever came last is
+                    # incomplete. Surface it rather than quietly under-report.
+                    with _coverage_lock:
+                        coverage.truncated_responses += 1
+                    _log.warning("response truncated at max_tokens (%s p.%s)",
+                                 doc_label, page)
                 return block.input
         return {}
     except Exception as exc:
