@@ -120,6 +120,10 @@ class Evidence:
     document: str
     page: int
     excerpt: str
+    verbatim: bool = False
+    """True only when `excerpt` was found character-for-character in the source
+    page text. When False the excerpt is the model's paraphrase and must not be
+    quoted back to a GC or owner as spec language."""
 
     def cite(self) -> str:
         return f"{self.document}, p.{self.page}"
@@ -187,6 +191,8 @@ class Coverage:
     llm_calls_made: int = 0
     llm_calls_failed: int = 0
     llm_last_error: str | None = None
+    quotes_verified: int = 0
+    quotes_unverified: int = 0
 
 
 @dataclass
@@ -465,8 +471,9 @@ EXTRACTION_TOOL = {
                         "label": {"type": "string", "description": "Short label, <10 words"},
                         "detail": {"type": "string", "description": "The scope item, close to verbatim"},
                         "cost_flag": {"type": "boolean", "description": "True if this item carries material/labor cost commonly missed in a sprinkler bid (firestopping, patching, permits, training, spare stock, etc.)"},
+                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text that supports this item. Copy, do not paraphrase or fix typos. 10-40 words."},
                     },
-                    "required": ["label", "detail", "cost_flag"],
+                    "required": ["label", "detail", "cost_flag", "quote"],
                 },
             },
             "design_criteria": {
@@ -476,8 +483,9 @@ EXTRACTION_TOOL = {
                     "properties": {
                         "category": {"type": "string", "description": "e.g. System type, Water supply, Head guards, Testing, AHJ approval"},
                         "requirement": {"type": "string", "description": "The technical requirement, close to verbatim"},
+                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text. Copy, do not paraphrase. 10-40 words."},
                     },
-                    "required": ["category", "requirement"],
+                    "required": ["category", "requirement", "quote"],
                 },
             },
             "interfaces": {
@@ -488,8 +496,9 @@ EXTRACTION_TOOL = {
                         "counterparty": {"type": "string", "description": "e.g. Electrical, Plumbing, Elevator, Fire Alarm"},
                         "description": {"type": "string"},
                         "direction": {"type": "string", "enum": ["they_provide", "we_provide", "coordinate"]},
+                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text. Copy, do not paraphrase. 10-40 words."},
                     },
-                    "required": ["counterparty", "description", "direction"],
+                    "required": ["counterparty", "description", "direction", "quote"],
                 },
             },
             "flags": {
@@ -501,8 +510,9 @@ EXTRACTION_TOOL = {
                         "detail": {"type": "string"},
                         "severity": {"type": "string", "enum": ["info", "coordinate", "rfi"]},
                         "suggested_rfi": {"type": "string", "description": "Only if severity is rfi; omit otherwise"},
+                        "quote": {"type": "string", "description": "VERBATIM span copied character-for-character from the source text that triggered this flag. Copy, do not paraphrase. 10-40 words."},
                     },
-                    "required": ["title", "detail", "severity"],
+                    "required": ["title", "detail", "severity", "quote"],
                 },
             },
         },
@@ -522,6 +532,10 @@ Rules:
   "if required", "TBD", "to be determined" are all ambiguity signals worth an
   RFI flag).
 - Do not invent items not supported by the text.
+- The `quote` field is NOT a place to paraphrase. Copy an exact span of
+  characters out of the block, including its original punctuation and any
+  typos. Every quote is checked against the source text and silently
+  discarded if it does not match, so a paraphrase there loses the citation.
 - cost_flag = true only for items that carry real, commonly-missed cost
   (firestopping, patching, permits, escutcheons, access panels, training,
   spare stock, cleanup) — not routine installation work.
@@ -569,31 +583,74 @@ def llm_extract(client, block_text: str, doc_label: str, page: int, coverage: Co
         return {}
 
 
-def _to_dataclasses(raw: dict, doc_label: str, page: int, excerpt_src: str) -> tuple[
+_WS_RX = re.compile(r"\s+")
+
+
+def _normalize_for_match(s: str) -> str:
+    """Collapse the differences that PDF text extraction introduces but that
+    don't change what the document actually says: runs of whitespace, the
+    various dash and quote characters, and case."""
+    s = _WS_RX.sub(" ", s)
+    for a, b in (("\u2014", "-"), ("\u2013", "-"), ("\u2019", "'"),
+                 ("\u2018", "'"), ("\u201c", '"'), ("\u201d", '"'),
+                 ("\ufb01", "fi"), ("\ufb02", "fl"), ("\u00a0", " ")):
+        s = s.replace(a, b)
+    return s.strip().lower()
+
+
+def _verify_quote(quote: str, source: str) -> str | None:
+    """Return the quote if it genuinely appears in `source`, else None.
+
+    The model is asked to copy verbatim, but a model can drift or hallucinate a
+    plausible-sounding line. An unverified quote is worse than no quote — it
+    looks like evidence. So every quote is checked against the extracted page
+    text before it is allowed to be called verbatim.
+    """
+    if not quote or len(quote) < 12:
+        return None
+    if _normalize_for_match(quote) in _normalize_for_match(source):
+        return quote.strip()
+    return None
+
+
+def _to_dataclasses(raw: dict, doc_label: str, page: int, excerpt_src: str,
+                    coverage: "Coverage | None" = None) -> tuple[
         list[ScopeItem], list[DesignCriterion], list[Interface], list[Flag]]:
     items, criteria, interfaces, flags = [], [], [], []
-    ev = lambda snippet: Evidence(doc_label, page, snippet[:300])
+
+    def ev(obj: dict, fallback_key: str) -> Evidence:
+        """Prefer a verified verbatim quote; fall back to the paraphrase, but
+        label it so downstream consumers know not to treat it as spec text."""
+        verified = _verify_quote(obj.get("quote", ""), excerpt_src)
+        if verified:
+            if coverage is not None:
+                coverage.quotes_verified += 1
+            return Evidence(doc_label, page, verified[:300], verbatim=True)
+        if coverage is not None:
+            coverage.quotes_unverified += 1
+        return Evidence(doc_label, page, obj.get(fallback_key, excerpt_src)[:300],
+                        verbatim=False)
 
     for si in raw.get("scope_items", []):
         items.append(ScopeItem(
             label=si.get("label", "")[:80],
             detail=si.get("detail", ""),
             confidence=Confidence.MEDIUM,
-            evidence=ev(si.get("detail", excerpt_src)),
+            evidence=ev(si, "detail"),
             cost_flag=bool(si.get("cost_flag", False)),
         ))
     for dc in raw.get("design_criteria", []):
         criteria.append(DesignCriterion(
             category=dc.get("category", "General"),
             requirement=dc.get("requirement", ""),
-            evidence=ev(dc.get("requirement", excerpt_src)),
+            evidence=ev(dc, "requirement"),
         ))
     for iface in raw.get("interfaces", []):
         interfaces.append(Interface(
             counterparty=iface.get("counterparty", "Unknown"),
             description=iface.get("description", ""),
             direction=iface.get("direction", "coordinate"),
-            evidence=ev(iface.get("description", excerpt_src)),
+            evidence=ev(iface, "description"),
         ))
     for fl in raw.get("flags", []):
         sev_raw = fl.get("severity", "info")
@@ -602,7 +659,7 @@ def _to_dataclasses(raw: dict, doc_label: str, page: int, excerpt_src: str) -> t
             title=fl.get("title", "")[:100],
             detail=fl.get("detail", ""),
             severity=sev,
-            evidence=ev(fl.get("detail", excerpt_src)),
+            evidence=ev(fl, "detail"),
             suggested_rfi=fl.get("suggested_rfi"),
         ))
     return items, criteria, interfaces, flags
@@ -700,12 +757,12 @@ def analyze(package: dict[str, str], profile: ContractorProfile) -> ScopeReport:
     if llm_available:
         for doc, page, header, block in scope_blocks:
             raw = llm_extract(client, block, doc.label, page, coverage)
-            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block[:200])
+            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block, coverage)
             all_items += i; all_criteria += c; all_interfaces += iface; all_flags += fl
 
         for doc, page, block in div21_blocks:
             raw = llm_extract(client, block, doc.label, page, coverage)
-            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block[:200])
+            i, c, iface, fl = _to_dataclasses(raw, doc.label, page, block, coverage)
             all_items += i; all_criteria += c; all_interfaces += iface; all_flags += fl
     else:
         all_flags.append(Flag(
