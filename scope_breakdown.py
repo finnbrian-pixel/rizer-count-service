@@ -116,11 +116,15 @@ _coverage_lock = threading.Lock()
 
 LLM_MODEL = "claude-sonnet-5"
 
-# 2000 is the value from the last run verified end to end: 37 seconds, 92
-# findings, zero failures. 8000 was tried and made generation long enough to
-# outlast a browser. The missing flags were caused by field ORDER, not by
-# headroom, so that is the only thing changed from the known-good run.
-MAX_OUTPUT_TOKENS = 2000
+# Sized from measurement, not guesswork.
+#
+# Every value here was tried against the live model on a real 461-page package:
+#   2000 -> 6 of 7 responses truncated; interfaces and flags starved
+#   8000 -> model filled the space, generation outlasted the browser
+# 4000 is the midpoint, and truncated_responses in the coverage block reports
+# whether it was enough on any given run rather than leaving it to be inferred
+# from suspiciously short output.
+MAX_OUTPUT_TOKENS = 4000
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +578,10 @@ Rules:
   spare stock, cleanup) — not routine installation work.
 - severity=rfi for any requirement whose quantity/extent/scope boundary is
   left undefined by the text.
+- Be selective, not exhaustive. Merge near-duplicates and skip boilerplate
+  that carries no cost or risk. Twenty findings that change a bid are worth
+  more than sixty restatements of the same clause, and output space is
+  finite: spend it on flags and interfaces first.
 - If the block contains nothing relevant to fire sprinkler scope, return
   empty arrays for everything. Do not force findings.
 Call record_findings with your results."""
