@@ -124,6 +124,31 @@ def _endpoint_near_head(s, heads, tol):
     return False
 
 
+# ──────────────────────────────────────────── sidewall perpendicular check ──
+
+def _is_sidewall(head: dict) -> bool:
+    symbol = (head.get("symbol") or "").upper()
+    head_type = (head.get("type") or "").upper()
+    return symbol == "TRIANGLE" or "SIDEWALL" in head_type
+
+def _perp_dist_point_to_segment(px, py, x1, y1, x2, y2) -> float:
+    dx, dy = x2 - x1, y2 - y1
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    nearest_x = x1 + t * dx
+    nearest_y = y1 + t * dy
+    return math.hypot(px - nearest_x, py - nearest_y)
+
+def _sidewall_connected(head_pt, seg_start, seg_end, tol=HEAD_TOL_PT) -> bool:
+    hx, hy = head_pt
+    x1, y1 = seg_start
+    x2, y2 = seg_end
+    return _perp_dist_point_to_segment(hx, hy, x1, y1, x2, y2) <= tol
+
+
 # ─────────────────────────────────────────────────────────── size labelling ──
 
 def size_labels(page, x_limit=None):
@@ -220,10 +245,12 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
     doc = fitz.open(pdf_path)
     page = doc[page_no]
 
+    head_dicts = None
     if heads is None or ft_per_pt is None or exclude_right_of is None:
         res = hc2.count_page(pdf_path, page_no)
         if heads is None:
-            heads = [(h["x"], h["y"]) for h in res["heads"]]
+            head_dicts = res["heads"]
+            heads = [(h["x"], h["y"]) for h in head_dicts]
         if exclude_right_of is None:
             zones = res.get("excluded_zones") or []
             exclude_right_of = min((z[0] for z in zones), default=page.rect.x1)
@@ -264,8 +291,24 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
         else:
             unassigned += s["len"] * ft_per_pt
 
-    connected = sum(1 for hx, hy in heads
-                    if any(_endpoint_near_head(s, [(hx, hy)], HEAD_TOL_PT) for s in raw))
+    # Sidewall heads connect perpendicular to pipe runs; others via endpoint proximity.
+    # Check against all voted pipe widths (secondary widths serve branch lines).
+    pipe_segs = [s for s in segments
+                 if any(abs(s["width"] - w) < WIDTH_TOL for w in votes)]
+
+    def _head_is_connected(idx):
+        hx, hy = heads[idx]
+        hd = head_dicts[idx] if head_dicts else {}
+        if _is_sidewall(hd):
+            return any(_sidewall_connected((hx, hy), (s["x0"], s["y0"]), (s["x1"], s["y1"]), HEAD_TOL_PT)
+                       for s in pipe_segs)
+        # Endpoint check on primary pipe, perpendicular fallback for T-connections
+        if any(_endpoint_near_head(s, [(hx, hy)], HEAD_TOL_PT) for s in pipe_segs):
+            return True
+        return any(_sidewall_connected((hx, hy), (s["x0"], s["y0"]), (s["x1"], s["y1"]), HEAD_TOL_PT)
+                   for s in pipe_segs)
+
+    connected = sum(1 for i in range(len(heads)) if _head_is_connected(i))
     coverage = connected / len(heads) if heads else 0.0
     total = sum(by_size.values()) + unassigned
 
