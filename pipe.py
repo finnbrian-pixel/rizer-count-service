@@ -272,7 +272,9 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
     if width is None or ft_per_pt is None:
         result.update({
             "total_ft": 0.0, "by_size": {}, "unassigned_ft": 0.0,
-            "heads_connected": 0, "confidence": 0.0, "needs_verification": True,
+            "heads_connected": 0, "confidence": 0.0,
+            "sizing_confidence": 0.0, "unassigned_pct": 0.0,
+            "needs_verification": True,
             "reason": "could not learn pipe stroke width" if width is None
                       else "sheet scale not found",
         })
@@ -312,6 +314,11 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
     coverage = connected / len(heads) if heads else 0.0
     total = sum(by_size.values()) + unassigned
 
+    # Pipe sizing confidence: fraction of total footage that was size-assigned
+    sized_ft = total - unassigned
+    sizing_confidence = round(sized_ft / total, 4) if total > 0 else 0.0
+    unassigned_pct = round((unassigned / total) * 100, 1) if total > 0 else 0.0
+
     # Confidence is grounded in something checkable: what share of the heads the
     # detected network actually reaches. A network that misses heads is missing
     # pipe, whatever its total says.
@@ -326,20 +333,25 @@ def pipe_takeoff(pdf_path, page_no=0, heads=None, ft_per_pt=None, exclude_right_
         "heads_connected": connected,
         "head_coverage": round(coverage, 3),
         "confidence": round(min(1.0, coverage), 3),
+        "sizing_confidence": sizing_confidence,
+        "unassigned_pct": unassigned_pct,
         "needs_verification": coverage < 0.95 or unassigned > total * 0.15,
-        "flags": _flags(coverage, unassigned, total),
+        "flags": _flags(coverage, unassigned, total, sizing_confidence),
     })
     doc.close()
     return result
 
 
-def _flags(coverage, unassigned, total):
+def _flags(coverage, unassigned, total, sizing_confidence=1.0):
     out = []
     if coverage < 0.95:
         out.append(f"{round((1-coverage)*100)}% of heads have no pipe connection — "
                    f"runs are likely missing from the total")
     if total and unassigned > total * 0.15:
         out.append(f"{round(unassigned)} ft could not be matched to a size callout")
+    if sizing_confidence < 0.95:
+        unassigned_ft = total - (sizing_confidence * total) if total else 0.0
+        out.append(f"{unassigned:.1f} ft unassigned ({100-sizing_confidence*100:.1f}% of total); pipe cost estimate is partial")
     if not out:
         out.append("every head reaches the detected pipe network")
     return out
